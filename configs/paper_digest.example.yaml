@@ -4,7 +4,7 @@
 
 email:
   recipient: "your-email@example.com"
-  smtp_host: "smtp.gmail.com"          # Gmail: smtp.gmail.com | QQ: smtp.qq.com | 163: smtp.163.com
+  smtp_host: "smtp.gmail.com"          # Gmail: smtp.gmail.com | Outlook: smtp-mail.outlook.com | QQ: smtp.qq.com
   smtp_port: 587
   smtp_user: "your-email@example.com"
   smtp_password: "your-app-password"   # 请使用应用专用密码，勿提交到 git
