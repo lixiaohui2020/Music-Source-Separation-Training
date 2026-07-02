@@ -50,6 +50,7 @@ train = [
   "wandb"
 ]
 validation = ["auraloss", "torch-l1-snr>=0.1.2", "torch-log-wmse>=0.3.1"]
+paper-digest = []
 # models
 apollo = ["pytorch-lightning"]
 bandit = [
