@@ -5,7 +5,7 @@
 email:
   recipient: "your-email@example.com"
   auth_method: smtp        # smtp（Gmail/QQ/163）| graph（Outlook 个人邮箱）
-  smtp_host: "smtp.gmail.com"          # Gmail: smtp.gmail.com | Outlook: smtp-mail.outlook.com | QQ: smtp.qq.com
+  smtp_host: "smtp.gmail.com"          # Gmail: smtp.gmail.com | QQ: smtp.qq.com | Outlook: 需 graph 模式
   smtp_port: 587
   smtp_user: "your-email@example.com"
   smtp_password: "your-app-password"   # 请使用应用专用密码，勿提交到 git
