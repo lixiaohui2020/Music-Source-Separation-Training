@@ -4,12 +4,16 @@
 
 email:
   recipient: "your-email@example.com"
+  auth_method: smtp        # smtp（Gmail/QQ/163）| graph（Outlook 个人邮箱）
   smtp_host: "smtp.gmail.com"          # Gmail: smtp.gmail.com | Outlook: smtp-mail.outlook.com | QQ: smtp.qq.com
   smtp_port: 587
   smtp_user: "your-email@example.com"
   smtp_password: "your-app-password"   # 请使用应用专用密码，勿提交到 git
   smtp_use_tls: true
   sender_name: "Vocal Separation Paper Digest"
+  graph:
+    client_id: ""          # Azure 应用客户端 ID（Outlook 个人邮箱必填）
+    authority: "https://login.microsoftonline.com/consumers"
 
 schedule:
   timezone: "Asia/Shanghai"   # 每天 8:00 按此时区发送

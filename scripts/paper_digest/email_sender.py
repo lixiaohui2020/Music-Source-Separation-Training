@@ -75,18 +75,30 @@ def send_digest_email(
 ) -> None:
     if not cfg.recipient:
         raise ValueError("未配置收件邮箱 (PAPER_DIGEST_RECIPIENT 或 configs/paper_digest.yaml)")
-    if not cfg.smtp_host or not cfg.smtp_user or not cfg.smtp_password:
-        raise ValueError("未配置 SMTP (host/user/password)")
 
     now = datetime.now(ZoneInfo(cfg.timezone))
     subject = f"【论文推送】人声/伴奏分离 · {now.strftime('%Y-%m-%d')} ({len(papers)} 篇)"
+    html_content = build_html_email(papers, cfg)
+
+    if cfg.auth_method == "graph":
+        from scripts.paper_digest.graph_sender import get_graph_access_token, send_mail_via_graph
+
+        access_token = get_graph_access_token(cfg)
+        send_mail_via_graph(
+            access_token=access_token,
+            recipient=cfg.recipient,
+            subject=subject,
+            html_body=html_content,
+        )
+        return
+
+    if not cfg.smtp_host or not cfg.smtp_user or not cfg.smtp_password:
+        raise ValueError("未配置 SMTP (host/user/password)，或改用 auth_method: graph")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = f"{cfg.sender_name} <{cfg.smtp_user}>"
     msg["To"] = cfg.recipient
-
-    html_content = build_html_email(papers, cfg)
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
     with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=60) as server:

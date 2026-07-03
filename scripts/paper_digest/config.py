@@ -20,6 +20,7 @@ DEFAULT_CATEGORIES = ["cs.SD", "eess.AS", "cs.LG"]
 
 @dataclass
 class PaperDigestConfig:
+    auth_method: str = "smtp"  # smtp | graph
     recipient: str = ""
     smtp_host: str = ""
     smtp_port: int = 587
@@ -27,6 +28,8 @@ class PaperDigestConfig:
     smtp_password: str = ""
     smtp_use_tls: bool = True
     sender_name: str = "Vocal Separation Paper Digest"
+    graph_client_id: str = ""
+    graph_authority: str = "https://login.microsoftonline.com/consumers"
     timezone: str = "Asia/Shanghai"
     schedule_hour: int = 8
     max_papers_per_day: int = 10
@@ -81,12 +84,17 @@ def load_config(config_path: str | Path | None = None) -> PaperDigestConfig:
     paths_cfg = raw.get("paths", {})
 
     cfg.recipient = _env("PAPER_DIGEST_RECIPIENT", email_cfg.get("recipient", cfg.recipient))
+    cfg.auth_method = _env("PAPER_DIGEST_AUTH_METHOD", email_cfg.get("auth_method", cfg.auth_method)).lower()
     cfg.smtp_host = _env("PAPER_DIGEST_SMTP_HOST", email_cfg.get("smtp_host", cfg.smtp_host))
     cfg.smtp_port = int(_env("PAPER_DIGEST_SMTP_PORT", str(email_cfg.get("smtp_port", cfg.smtp_port))))
     cfg.smtp_user = _env("PAPER_DIGEST_SMTP_USER", email_cfg.get("smtp_user", cfg.smtp_user))
     cfg.smtp_password = _env("PAPER_DIGEST_SMTP_PASSWORD", email_cfg.get("smtp_password", cfg.smtp_password))
     cfg.smtp_use_tls = bool(email_cfg.get("smtp_use_tls", cfg.smtp_use_tls))
     cfg.sender_name = email_cfg.get("sender_name", cfg.sender_name)
+
+    graph_cfg = email_cfg.get("graph", {})
+    cfg.graph_client_id = _env("PAPER_DIGEST_GRAPH_CLIENT_ID", graph_cfg.get("client_id", cfg.graph_client_id))
+    cfg.graph_authority = graph_cfg.get("authority", cfg.graph_authority)
 
     cfg.timezone = _env("PAPER_DIGEST_TIMEZONE", schedule_cfg.get("timezone", cfg.timezone))
     cfg.schedule_hour = int(schedule_cfg.get("hour", cfg.schedule_hour))
