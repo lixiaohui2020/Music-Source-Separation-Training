@@ -14,6 +14,7 @@ def main() -> None:
         description="Outlook 个人邮箱 OAuth 授权（Microsoft Graph API）"
     )
     parser.add_argument("--config", type=str, default=None, help="配置文件路径")
+    parser.add_argument("--user-code", type=str, default=None, help="已获取的设备码（用于提示核对）")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -35,7 +36,7 @@ def main() -> None:
 
     print(f"将为账号 {cfg.smtp_user} 进行 OAuth 授权...")
     try:
-        acquire_token_interactive(cfg)
+        acquire_token_interactive(cfg, user_code_hint=args.user_code)
         print("\n✅ 授权成功！token 已保存，可运行 python -m scripts.paper_digest.main 发送邮件。")
     except Exception as exc:
         print(f"\n❌ 授权失败: {exc}", file=sys.stderr)

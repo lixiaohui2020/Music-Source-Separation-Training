@@ -10,7 +10,7 @@ from scripts.paper_digest.config import PaperDigestConfig
 logger = logging.getLogger(__name__)
 
 GRAPH_SEND_MAIL_URL = "https://graph.microsoft.com/v1.0/me/sendMail"
-DEFAULT_SCOPES = ["Mail.Send", "offline_access", "openid", "profile"]
+DEFAULT_SCOPES = ["https://graph.microsoft.com/Mail.Send"]
 
 
 def _token_cache_path(cfg: PaperDigestConfig) -> Path:
@@ -43,7 +43,7 @@ def _save_cache(token_cache, cache_path: Path) -> None:
         cache_path.write_text(token_cache.serialize(), encoding="utf-8")
 
 
-def acquire_token_interactive(cfg: PaperDigestConfig) -> str:
+def acquire_token_interactive(cfg: PaperDigestConfig, *, user_code_hint: str | None = None) -> str:
     """One-time device-code authorization for Outlook personal accounts."""
     if not cfg.graph_client_id:
         raise ValueError(
@@ -66,6 +66,10 @@ def acquire_token_interactive(cfg: PaperDigestConfig) -> str:
 
     print("\n" + "=" * 60)
     print(flow["message"])
+    if user_code_hint and flow.get("user_code") != user_code_hint:
+        print(f"\n注意: 你提供的设备码 {user_code_hint} 与本次会话不匹配。")
+        print(f"请使用本次设备码: {flow.get('user_code')}")
+        print("（设备码每次启动授权都会变化，且 15 分钟内有效）")
     print("=" * 60 + "\n")
 
     result = app.acquire_token_by_device_flow(flow)
