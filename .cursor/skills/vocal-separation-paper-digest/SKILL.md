@@ -40,23 +40,35 @@ pip install -e ".[paper-digest]"
 
 ### 2. 配置
 
-复制示例配置并填写邮箱与 SMTP：
+复制示例配置并填写邮箱：
 
 ```bash
 cp configs/paper_digest.example.yaml configs/paper_digest.yaml
 # 编辑 configs/paper_digest.yaml
 ```
 
-或使用环境变量（优先级高于配置文件）：
+**Outlook 个人邮箱（`@outlook.com`）** 必须用 Graph OAuth，详见 [docs/paper_digest_outlook_setup.md](docs/paper_digest_outlook_setup.md)。
+
+**Gmail / QQ / 163** 可使用 SMTP + 应用专用密码（`auth_method: smtp`）。
+
+环境变量（优先级高于配置文件）：
 
 | 变量 | 说明 |
 |------|------|
 | `PAPER_DIGEST_RECIPIENT` | 收件邮箱 |
+| `PAPER_DIGEST_AUTH_METHOD` | `smtp` 或 `graph` |
 | `PAPER_DIGEST_SMTP_HOST` | SMTP 服务器 |
 | `PAPER_DIGEST_SMTP_PORT` | 端口（默认 587） |
 | `PAPER_DIGEST_SMTP_USER` | 发件账号 |
 | `PAPER_DIGEST_SMTP_PASSWORD` | 密码/应用专用密码 |
+| `PAPER_DIGEST_GRAPH_CLIENT_ID` | Azure 应用客户端 ID（Outlook 必填） |
 | `PAPER_DIGEST_TIMEZONE` | 时区（默认 `Asia/Shanghai`） |
+
+### 2b. Outlook OAuth 授权（仅 graph 模式）
+
+```bash
+python -m scripts.paper_digest.setup_outlook_oauth --client-id <你的Azure客户端ID>
+```
 
 ### 3. 手动试跑
 
