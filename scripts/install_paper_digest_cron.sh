@@ -13,6 +13,13 @@ mkdir -p "${REPO_ROOT}/data/paper_digest"
 CRON_LINE="${CRON_MINUTE} ${CRON_HOUR} * * * cd ${REPO_ROOT} && ${PYTHON_BIN} -m scripts.paper_digest.main >> ${LOG_FILE} 2>&1"
 
 # Remove any existing paper_digest cron entries, then add the new one
+if ! command -v crontab >/dev/null 2>&1; then
+  echo "⚠️  当前环境未安装 cron。"
+  echo "   可使用 GitHub Actions 定时推送：在仓库 Settings → Secrets 添加 PAPER_DIGEST_SMTP_PASSWORD"
+  echo "   工作流文件: .github/workflows/paper_digest.yml"
+  exit 0
+fi
+
 (crontab -l 2>/dev/null | grep -v "scripts.paper_digest.main" || true; echo "${CRON_LINE}") | crontab -
 
 echo "✅ Cron job installed:"
