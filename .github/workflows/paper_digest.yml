@@ -10,6 +10,16 @@ jobs:
   send-digest:
     runs-on: ubuntu-latest
     steps:
+      - name: Check SMTP secret is configured
+        env:
+          SMTP_PASSWORD: ${{ secrets.PAPER_DIGEST_SMTP_PASSWORD }}
+        run: |
+          if [ -z "$SMTP_PASSWORD" ]; then
+            echo "::error::未配置 GitHub Secret: PAPER_DIGEST_SMTP_PASSWORD"
+            echo "请在仓库 Settings → Secrets and variables → Actions 中添加该密钥（QQ 邮箱授权码）"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
