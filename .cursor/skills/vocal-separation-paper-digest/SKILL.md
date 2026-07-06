@@ -80,6 +80,16 @@ python -m scripts.paper_digest.main --force     # 忽略去重，重发今日内
 
 ### 4. 安装每日 8:00 定时任务
 
+**GitHub Actions（推荐）**
+
+工作流文件：`.github/workflows/paper_digest.yml`（必须在 `main` 分支）
+
+> Fork 仓库默认**禁用**定时任务！必须在仓库 **Actions** 页手动启用 workflow，并在 **Settings → Secrets** 添加 `PAPER_DIGEST_SMTP_PASSWORD`（QQ 授权码）。
+
+启用后可在 Actions 页 **Run workflow** 手动测试。定时：每天 8:00 北京时间（`0 0 UTC`）。
+
+**本机 cron**
+
 ```bash
 bash scripts/install_paper_digest_cron.sh
 ```
