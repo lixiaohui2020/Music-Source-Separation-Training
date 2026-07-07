@@ -27,14 +27,24 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+
 def forward_step(x, y, active_stem_ids, get_internal_loss, model, multi_loss, device_ids):
     if get_internal_loss:
-        loss =model(x, y, active_stem_ids=active_stem_ids)
+        loss = model(x, y, active_stem_ids=active_stem_ids)
         if isinstance(device_ids, (list, tuple)):
             loss = loss.mean()
         return loss
     else:
         y_ = model(x)
+
+        # Uncomment this if you have problem with gradients with enabled amp
+        if 0:
+            # Temporarily disable AMP (switch to float32) only for loss calculation
+            with torch.cuda.amp.autocast(enabled=False):
+                # Force cast predictions and targets to float32
+                x_float = x.float() if x is not None else None
+                return multi_loss(y_.float(), y.float(), x_float)
+
         return multi_loss(y_, y, x)
 
 
