@@ -1,0 +1,47 @@
+name: Daily Paper Digest
+
+on:
+  schedule:
+    # 每天 8:00 Asia/Shanghai (= 00:00 UTC)
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check SMTP secret is configured
+        env:
+          SMTP_PASSWORD: ${{ secrets.PAPER_DIGEST_SMTP_PASSWORD }}
+        run: |
+          if [ -z "$SMTP_PASSWORD" ]; then
+            echo "::error::未配置 GitHub Secret: PAPER_DIGEST_SMTP_PASSWORD"
+            echo "请在仓库 Settings → Secrets and variables → Actions 中添加该密钥（QQ 邮箱授权码）"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore sent-papers cache
+        uses: actions/cache@v4
+        with:
+          path: data/paper_digest/sent_papers.json
+          key: paper-digest-sent-${{ github.repository }}
+
+      - name: Install dependencies
+        run: pip install PyYAML requests
+
+      - name: Send daily paper digest
+        env:
+          PAPER_DIGEST_AUTH_METHOD: smtp
+          PAPER_DIGEST_RECIPIENT: lixiaohui@allwinnertech.com
+          PAPER_DIGEST_SMTP_HOST: smtp.qq.com
+          PAPER_DIGEST_SMTP_PORT: "587"
+          PAPER_DIGEST_SMTP_USER: 1055864643@qq.com
+          PAPER_DIGEST_SMTP_PASSWORD: ${{ secrets.PAPER_DIGEST_SMTP_PASSWORD }}
+          PAPER_DIGEST_TIMEZONE: Asia/Shanghai
+        run: python -m scripts.paper_digest.main

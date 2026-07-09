@@ -74,3 +74,9 @@ Scripts/
 
 results/
 wandb/
+
+# Paper digest local config and runtime data
+configs/paper_digest.yaml
+configs/paper_digest.local.yaml
+data/paper_digest/
+data/paper_digest/ms_token_cache.json

@@ -1,0 +1,39 @@
+# 人声/伴奏分离 · 每日论文推送配置
+# 复制为 paper_digest.yaml 并填写你的邮箱信息：
+#   cp configs/paper_digest.example.yaml configs/paper_digest.yaml
+
+email:
+  recipient: "your-email@example.com"
+  auth_method: smtp        # smtp（Gmail/QQ/163）| graph（Outlook 个人邮箱）
+  smtp_host: "smtp.gmail.com"          # Gmail: smtp.gmail.com | QQ: smtp.qq.com | Outlook: 需 graph 模式
+  smtp_port: 587
+  smtp_user: "your-email@example.com"
+  smtp_password: "your-app-password"   # 请使用应用专用密码，勿提交到 git
+  smtp_use_tls: true
+  sender_name: "Vocal Separation Paper Digest"
+  graph:
+    client_id: ""          # Azure 应用客户端 ID（Outlook 个人邮箱必填）
+    authority: "https://login.microsoftonline.com/consumers"
+
+schedule:
+  timezone: "Asia/Shanghai"   # 每天 8:00 按此时区发送
+  hour: 8
+
+search:
+  max_papers_per_day: 10
+  lookback_days: 7          # 日常回溯天数（仅推送未发送过的新论文）
+  initial_lookback_days: 30 # 首次运行回溯天数
+  queries:
+    - 'all:"vocal separation" OR all:"vocals separation"'
+    - 'all:"accompaniment separation"'
+    - 'all:"music source separation" AND all:vocals'
+    - 'all:"singing voice separation"'
+    - 'all:"stem separation" AND all:vocals'
+    - 'ti:"source separation" AND (ti:vocal OR ti:vocals OR ti:singing)'
+  categories:
+    - cs.SD
+    - eess.AS
+    - cs.LG
+
+paths:
+  data_dir: data/paper_digest
