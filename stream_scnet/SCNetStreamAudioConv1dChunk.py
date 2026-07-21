@@ -1902,10 +1902,41 @@ def test_scnet_nostft():
     cache_stft_0 = torch.zeros([2, 2 * hop_size], dtype=torch.float32)
 
     stream_output = []
+    wave_chunks = []
+    # 流式 OLA ISTFT（与 SCNetStream.forward 相同），每来一帧立刻反变换并输出 hop 采样
+    n_ola = len(scnet.sources) * scnet.audio_channels  # 4
+    overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
+    window_sum = torch.zeros([n_fft], dtype=torch.float32)
+    win = scnet_stream.stft_window
+    win_pow = scnet_stream.stft_window_power
+    irfft_real = scnet_stream.irfft_real
+    irfft_imag = scnet_stream.irfft_imag
+
+    def push_ola_istft(spec_rt):
+        """spec_rt: (N, F, T_new, 2) → 本包新增波形 (N, T_new * hop)。"""
+        nonlocal overlap_buffer, window_sum
+        outs = []
+        for t in range(spec_rt.shape[-2]):
+            xr = spec_rt[:, :, t, 0]
+            xi = spec_rt[:, :, t, 1]
+            time_frame = torch.matmul(xr, irfft_real) - torch.matmul(xi, irfft_imag)
+            window_frame = time_frame * win
+            overlap_buffer = overlap_buffer + window_frame
+            window_sum = window_sum + win_pow
+            chunk = overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+            outs.append(chunk)
+            overlap_buffer = torch.cat(
+                [overlap_buffer[:, hop_size:], torch.zeros(n_ola, hop_size)], dim=-1
+            )
+            window_sum = torch.cat(
+                [window_sum[hop_size:], torch.zeros(hop_size)], dim=0
+            )
+        return torch.cat(outs, dim=-1) if outs else torch.zeros(n_ola, 0)
+
     stft_cfg = dict(scnet_stream.stft_config)
     stft_cfg['center'] = False  # 左右 pad 已手工加上
     with torch.no_grad():
-        # 首包: 左零填(2hop) + 4hop 音频 -> 3 帧，只填 lookahead
+        # 首包: 左零填(2hop) + 4hop 音频 -> 3 帧，只填 lookahead（尚无模型输出）
         input_chunk = pad_input_ext[..., 0:hop_size * 4]
         stft_x = torch.stft(
             torch.cat([cache_stft_0, input_chunk], dim=-1),
@@ -1920,8 +1951,9 @@ def test_scnet_nostft():
         _, *state = scnet_stream.forward_1st_frame(x, *state)
         cache_stft_0 = input_chunk[:, -3 * hop_size:]
 
-        # 中间包: 每次 3hop -> 3 帧
-        for i in range(int((L_ext - hop_size * 4) / (3 * hop_size))):
+        # 中间包: 每次 3hop -> 3 帧；模型一有输出就立刻 OLA ISTFT
+        n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+        for i in range(n_mid):
             start = (i * 3 + 4) * hop_size
             end = (i * 3 + 7) * hop_size
             input_chunk = pad_input_ext[..., start:end]
@@ -1938,31 +1970,33 @@ def test_scnet_nostft():
             cache_stft_0 = input_chunk
             chunk_output, *state = scnet_stream(x, *state)
             stream_output.append(chunk_output)
+            wave_chunks.append(push_ola_istft(chunk_output))
 
-        # flush lookahead
+        # flush lookahead，并立刻 ISTFT
         chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
         stream_output.append(chunk_output)
+        wave_chunks.append(push_ola_istft(chunk_output))
+
+        # center=True 还需要再吐 1 个 hop，才能凑齐 length=L（见右端 pad）
+        wave_chunks.append(
+            overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+        )
 
     stream_output = torch.cat(stream_output, dim=-2)  # (N, F, T, 2)
+
+    # OLA 时间轴含左 pad，去掉 n_fft//2 后取 L（对齐 torch.istft center=True, length=L）
+    wave_ola = torch.cat(wave_chunks, dim=-1)
+    pad = n_fft // 2
+    wave_stream = wave_ola[:, pad:pad + L].reshape(wave_ref.shape)
 
     print(f"[STFT+nostft] spec_ref={tuple(spec_ref.shape)}, stream={tuple(stream_output.shape)}")
     min_len = min(stream_output.shape[-2], spec_ref.shape[-2])
     diff_spec = (stream_output[:, :, :min_len, :] - spec_ref[:, :, :min_len, :]).abs()
     print(f"[STFT+nostft] max diff = {diff_spec.max().item():.6e}, mean diff = {diff_spec.mean().item():.6e}")
 
-    # ISTFT：与离线 SCNet 相同参数（center=True, normalized=True, hann）
-    istft_cfg = dict(scnet.stft_config)  # center=True
-    wave_stream = torch.istft(
-        torch.view_as_complex(stream_output.contiguous()),
-        **istft_cfg,
-        window=scnet.stft_window,
-        length=L,
-    )
-    wave_stream = wave_stream.reshape(wave_ref.shape)
-
-    print(f"[STFT+nostft+ISTFT] wave_ref={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
+    print(f"[STFT+nostft+OLA_ISTFT] wave_ref={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
     diff_wave = (wave_stream - wave_ref).abs()
-    print(f"[STFT+nostft+ISTFT] max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
+    print(f"[STFT+nostft+OLA_ISTFT] max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
 
 
 if __name__ == '__main__':
