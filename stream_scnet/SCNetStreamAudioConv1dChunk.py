@@ -1903,35 +1903,60 @@ def test_scnet_nostft():
 
     stream_output = []
     wave_chunks = []
-    # 流式 OLA ISTFT（与 SCNetStream.forward 相同），每来一帧立刻反变换并输出 hop 采样
+    # 流式 OLA ISTFT：只用小型 overlap 状态 + torch.fft.irfft 批量反变换
+    # 不再使用 irfft_real/irfft_imag 大矩阵，也不再逐帧 Python 循环 matmul
     n_ola = len(scnet.sources) * scnet.audio_channels  # 4
     overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
     window_sum = torch.zeros([n_fft], dtype=torch.float32)
     win = scnet_stream.stft_window
-    win_pow = scnet_stream.stft_window_power
-    irfft_real = scnet_stream.irfft_real
-    irfft_imag = scnet_stream.irfft_imag
+    win_pow = win * win
+    fft_scale = n_fft ** 0.5  # 对齐 normalized=True 的 ISTFT 幅度
 
     def push_ola_istft(spec_rt):
-        """spec_rt: (N, F, T_new, 2) → 本包新增波形 (N, T_new * hop)。"""
+        """
+        高效流式 ISTFT。
+        spec_rt: (N, F, T_new, 2) → (N, T_new * hop)
+        - irfft 对 T_new 帧一次批处理
+        - fold 做 overlap-add
+        - 状态仅保留 (N, n_fft) / (n_fft,) 的尾部缓冲
+        """
         nonlocal overlap_buffer, window_sum
-        outs = []
-        for t in range(spec_rt.shape[-2]):
-            xr = spec_rt[:, :, t, 0]
-            xi = spec_rt[:, :, t, 1]
-            time_frame = torch.matmul(xr, irfft_real) - torch.matmul(xi, irfft_imag)
-            window_frame = time_frame * win
-            overlap_buffer = overlap_buffer + window_frame
-            window_sum = window_sum + win_pow
-            chunk = overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
-            outs.append(chunk)
-            overlap_buffer = torch.cat(
-                [overlap_buffer[:, hop_size:], torch.zeros(n_ola, hop_size)], dim=-1
-            )
-            window_sum = torch.cat(
-                [window_sum[hop_size:], torch.zeros(hop_size)], dim=0
-            )
-        return torch.cat(outs, dim=-1) if outs else torch.zeros(n_ola, 0)
+        n, _, t_new, _ = spec_rt.shape
+        if t_new == 0:
+            return torch.zeros(n, 0, dtype=spec_rt.dtype, device=spec_rt.device)
+
+        # (N, T, F) complex → (N, T, n_fft)
+        spec_c = torch.view_as_complex(spec_rt.permute(0, 2, 1, 3).contiguous())
+        frames = torch.fft.irfft(spec_c, n=n_fft, dim=-1).mul_(fft_scale)
+        frames.mul_(win)  # (N, T, n_fft)
+
+        ola_len = n_fft + (t_new - 1) * hop_size
+        # fold: (N, n_fft, T) → (N, 1, ola_len)
+        frames_nct = frames.transpose(1, 2).contiguous()
+        ola = F.fold(
+            frames_nct,
+            output_size=(1, ola_len),
+            kernel_size=(1, n_fft),
+            stride=(1, hop_size),
+        ).reshape(n, ola_len)
+        ola[:, :n_fft] += overlap_buffer
+
+        w_frames = win_pow.view(1, n_fft, 1).expand(1, n_fft, t_new)
+        wola = F.fold(
+            w_frames,
+            output_size=(1, ola_len),
+            kernel_size=(1, n_fft),
+            stride=(1, hop_size),
+        ).reshape(ola_len)
+        wola[:n_fft] += window_sum
+
+        out_len = t_new * hop_size
+        out = ola[:, :out_len] / (wola[:out_len] + 1e-10)
+
+        # 尾部回写为下一包的 overlap 状态（长度仍为 n_fft）
+        overlap_buffer = F.pad(ola[:, out_len:], (0, hop_size))
+        window_sum = F.pad(wola[out_len:], (0, hop_size))
+        return out
 
     stft_cfg = dict(scnet_stream.stft_config)
     stft_cfg['center'] = False  # 左右 pad 已手工加上
