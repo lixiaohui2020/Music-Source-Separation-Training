@@ -17,7 +17,7 @@ def main():
     wrapper = LastONNXWrapper(model)
     path = Path(__file__).parent / "onnx" / "scnet_last.onnx"
     export_onnx(wrapper, make_example_state(), path, LAST_INPUT_NAMES, LAST_OUTPUT_NAMES)
-    print(f"Exported {path}")
+    print(f"Exported and simplified {path}")
 
 
 if __name__ == "__main__":

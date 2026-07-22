@@ -21,7 +21,7 @@ def main():
     cache_in = make_example_state()[:11]
     path = Path(__file__).parent / "onnx" / "scnet_first.onnx"
     export_onnx(wrapper, (spec_in, *cache_in), path, FIRST_INPUT_NAMES, FIRST_OUTPUT_NAMES)
-    print(f"Exported {path}")
+    print(f"Exported and simplified {path}")
 
 
 if __name__ == "__main__":

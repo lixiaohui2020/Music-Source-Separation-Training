@@ -99,7 +99,7 @@ def main():
         last_ort = _run_ort(ONNX_DIR / "scnet_last.onnx", LAST_INPUT_NAMES, tuple(mid_ort[1:]))
         _assert_close("last", last_torch, last_ort)
 
-    print("ONNX Runtime alignment passed; exported graphs contain no STFT/FFT nodes.")
+    print("ONNX Runtime alignment passed; exported graphs were onnxsim-simplified and contain no STFT/FFT nodes.")
 
 
 if __name__ == "__main__":

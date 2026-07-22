@@ -20,7 +20,7 @@ def main():
     spec_in = torch.randn(1, 4, 2049, 3)
     path = Path(__file__).parent / "onnx" / "scnet_mid.onnx"
     export_onnx(wrapper, (spec_in, *make_example_state()), path, MID_INPUT_NAMES, MID_OUTPUT_NAMES)
-    print(f"Exported {path}")
+    print(f"Exported and simplified {path}")
 
 
 if __name__ == "__main__":

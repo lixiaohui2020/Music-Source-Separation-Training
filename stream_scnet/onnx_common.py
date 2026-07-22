@@ -171,6 +171,16 @@ class LastONNXWrapper(nn.Module):
         return (spec_out, *state_out)
 
 
+def _assert_no_fft_nodes(graph, path: Path) -> None:
+    import onnx
+
+    onnx.checker.check_model(graph)
+    banned = {"STFT", "DFT", "FFT", "RFFT", "IRFFT"}
+    found = sorted({node.op_type for node in graph.graph.node if node.op_type.upper() in banned})
+    if found:
+        raise RuntimeError(f"{path.name} unexpectedly contains FFT/STFT nodes: {found}")
+
+
 def export_onnx(
     wrapper: nn.Module,
     args: Tuple[torch.Tensor, ...],
@@ -178,27 +188,41 @@ def export_onnx(
     input_names,
     output_names,
     opset_version: int = 17,
+    simplify: bool = True,
 ) -> None:
-    """Export a static-shape ONNX model and ensure it contains no FFT/STFT nodes."""
+    """Export a static-shape ONNX model, optionally simplify with onnxsim, and verify no FFT/STFT nodes."""
     import onnx
+    import onnxsim
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wrapper.eval()
+    raw_path = path.with_name(f"{path.stem}.raw{path.suffix}")
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
             args,
-            str(path),
+            str(raw_path),
             input_names=list(input_names),
             output_names=list(output_names),
             opset_version=opset_version,
             do_constant_folding=True,
             dynamo=False,
         )
-    graph = onnx.load(str(path))
-    onnx.checker.check_model(graph)
-    banned = {"STFT", "DFT", "FFT", "RFFT", "IRFFT"}
-    found = sorted({node.op_type for node in graph.graph.node if node.op_type.upper() in banned})
-    if found:
-        raise RuntimeError(f"{path.name} unexpectedly contains FFT/STFT nodes: {found}")
+    graph = onnx.load(str(raw_path))
+    _assert_no_fft_nodes(graph, path)
+
+    if simplify:
+        input_data = {
+            name: tensor.detach().cpu().numpy()
+            for name, tensor in zip(input_names, args)
+        }
+        graph, check_ok = onnxsim.simplify(graph, input_data=input_data)
+        if not check_ok:
+            raise RuntimeError(f"onnxsim verification failed for {path.name}")
+        onnx.save(graph, str(path))
+        raw_path.unlink(missing_ok=True)
+    else:
+        raw_path.replace(path)
+
+    _assert_no_fft_nodes(graph, path)
 
