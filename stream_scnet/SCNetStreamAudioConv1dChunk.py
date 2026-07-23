@@ -14,7 +14,6 @@ import numpy as np
 # import parser  # removed in Python 3.10+; unused
 import argparse
 import soundfile as sf
-from scnet.apply import apply_model
 from pathlib import Path
 from scnet.utils import convert_audio
 
@@ -527,14 +526,8 @@ class SCNet(nn.Module):
     def forward(self, x):
         # B, C, L = x.shape
         B = x.shape[0]
-        # In the initial padding, ensure that the number of frames after the STFT (the length of the T dimension) is even,
-        # so that the RFFT operation can be used in the separation network.
-        padding = self.hop_length - x.shape[-1] % self.hop_length
-        if (x.shape[-1] + padding) // self.hop_length % 2 == 0:
-            padding += self.hop_length
-        x = F.pad(x, (0, padding))
 
-        # STFT
+        # STFT (caller must pad x to an even STFT frame count before forward)
         L = x.shape[-1]
         x = x.reshape(-1, L)
         x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
@@ -571,8 +564,6 @@ class SCNet(nn.Module):
 
         x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device))
         x = x.reshape(B, len(self.sources), self.audio_channels, -1)
-
-        x = x[:, :, :, :-padding]
         return x
 
     def forward_stft(self, x):
@@ -2601,7 +2592,6 @@ def test_scnet():
     # ------------------------------------------------------------------
     # 在 nostft 流式基础上加 STFT / ISTFT，与完整 SCNet 波形对齐
     # STFT: center=True, pad_mode='constant'  <=>  左右各补 n_fft//2 零 + center=False
-    # 流式输入长度需与 SCNet.forward 内部 hop pad 后的长度一致（见 infer_scnet_stream_aligned）
     # ------------------------------------------------------------------
     hop_size, n_fft, T = 1024, 4096, 16000
     torch.manual_seed(42)
@@ -2613,43 +2603,31 @@ def test_scnet():
     convert_state_dict(scnet, scnet_stream)
     scnet_stream.eval()
 
-    wave_ref, wave_stream, pad_input = infer_scnet_stream_aligned(
-        scnet, scnet_stream, input, hop_size, n_fft
-    )
+    pad_mix, _ = pad_mix_for_scnet(input, hop_size)
+    with torch.no_grad():
+        wave_ref = scnet(pad_mix[None])
+        wave_stream = infer_scnet_stream(scnet_stream, pad_mix, hop_size, n_fft)
 
     print(f"[STFT+nostft+OLA_ISTFT] wave_ref={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
     diff_wave = (wave_stream - wave_ref).abs()
     print(f"[STFT+nostft+OLA_ISTFT] max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
 
 
-def pad_mix_for_stream(mix, hop_size=1024):
+def pad_mix_for_scnet(mix, hop_size=1024):
     """
-    Pad mix so that after SCNet.forward's internal hop padding, the STFT
-    frame count T_frames = 1 + L_internal/hop is divisible by 3 (lookahead).
+    Pad mix once for both non-stream SCNet and streaming inference.
 
-    Returns (pad_input, extra_pad) where pad_input is fed to SCNet; the stream
-    path should further apply the same internal SCNet pad before inferring.
+    - hop alignment: STFT frame count must be odd (center=True => T = 1 + L/hop)
+    - stream alignment: T must be divisible by 3 (lookahead=3)
     """
-    L0 = mix.shape[-1]
-    extra = 0
-    while True:
-        L = L0 + extra
-        scnet_pad = hop_size - (L % hop_size)
-        if (L + scnet_pad) // hop_size % 2 == 0:
-            scnet_pad += hop_size
-        t_frames = 1 + (L + scnet_pad) // hop_size
-        if t_frames % 3 == 0:
-            break
-        extra += hop_size
-    return F.pad(mix, (0, extra)), extra
-
-
-def scnet_internal_pad(wave, hop_size=1024):
-    """Replicate SCNet.forward hop padding (before STFT)."""
-    padding = hop_size - wave.shape[-1] % hop_size
-    if (wave.shape[-1] + padding) // hop_size % 2 == 0:
+    padding = hop_size - mix.shape[-1] % hop_size
+    if (mix.shape[-1] + padding) // hop_size % 2 == 0:
         padding += hop_size
-    return F.pad(wave, (0, padding)), padding
+    L = mix.shape[-1] + padding
+    t_frames = 1 + L // hop_size
+    if t_frames % 3 != 0:
+        padding += ((3 - t_frames % 3) % 3) * hop_size
+    return F.pad(mix, (0, padding)), padding
 
 
 def infer_scnet_stream(scnet_stream, pad_input, hop_size=1024, n_fft=4096):
@@ -2775,30 +2753,12 @@ def infer_scnet_stream(scnet_stream, pad_input, hop_size=1024, n_fft=4096):
     )
 
 
-def infer_scnet_stream_aligned(scnet, scnet_stream, mix, hop_size=1024, n_fft=4096):
-    """
-    Run non-stream SCNet and streaming SCNet on the same mix with matched padding.
-
-    Returns (wave_ref, wave_stream, pad_input) both shaped [1, S, C, L_pad],
-    trimmed to the length SCNet returns (after its internal pad/trim).
-    """
-    pad_input, _ = pad_mix_for_stream(mix, hop_size)
-    stream_input, scnet_pad = scnet_internal_pad(pad_input, hop_size)
-    with torch.no_grad():
-        wave_ref = scnet(pad_input)
-        wave_stream_full = infer_scnet_stream(scnet_stream, stream_input, hop_size, n_fft)
-        # SCNet trims its internal pad; keep the same region from the stream output
-        wave_stream = wave_stream_full[..., :pad_input.shape[-1]]
-    return wave_ref, wave_stream, pad_input
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Music Source Separation using SCNet")
     parser.add_argument('--input_dir', type=str,
                         default='/home/data1/lixiaohui/_Codes/_Python/001_audio/'
                                 'source_separation/demucs_master/demucs/data/'
                                 '2026-02-02/wav/LBI利比（时柏尘） - 小城夏天_215613356.wav',
-                        # default='/home/data1/lixiaohui/_Data/002_source_separation/source/Test/20260330/wav',
                         help='Input directory containing audio files')
     parser.add_argument('--output_dir', type=str,
                         default='../output/scnet_subchannel_MusdbhqMoisedbDsdCCMixterClean_lr3e-4_normTrue_2cls_streamSTFT64-128-64-LSTMTimeUniLastConv1dDplayer2_noscalar_pre103_adjustlr/',
@@ -2808,11 +2768,12 @@ def parse_args():
                         help='Path to model checkpoint file')
     parser.add_argument('--instruments', type=str,
                         default=['accompaniment', 'vocals'],
-                        help='Path to model checkpoint file')
+                        help='List of source names to separate')
     parser.add_argument('--save_dir', type=str,
                         default="./output/小城夏天_215613356",
-                        help='Path to model checkpoint file')
+                        help='Directory to save separated sources')
     return parser.parse_args()
+
 
 def test_full_scnet():
     args = parse_args()
@@ -2823,25 +2784,24 @@ def test_full_scnet():
     audio_data, sample_rate = load_audio(args.input_dir)
     mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
     mix = convert_audio(mix, sample_rate, sample_rate, 2)
+    orig_len = mix.shape[-1]
 
-    # ------------------------------------------------------------------
-    # Non-stream inference (unchanged): model load / data load / apply_model
-    # ------------------------------------------------------------------
-    with torch.no_grad():
-        output = apply_model(scnet, mix[None], shifts=1, split=True, overlap=0.5, progress=False)[0]
-        # output = None
-
-    # ------------------------------------------------------------------
-    # Stream inference: same weights, padding matched to SCNet.forward
-    # ------------------------------------------------------------------
     hop_size, n_fft = 1024, 4096
+    pad_mix, _ = pad_mix_for_scnet(mix, hop_size)
+
     scnet_stream = SCNetStreamNoSTFT(sources=list(args.instruments))
     convert_state_dict(scnet, scnet_stream)
     scnet_stream.eval()
 
-    wave_ref, wave_stream, pad_input = infer_scnet_stream_aligned(
-        scnet, scnet_stream, mix, hop_size, n_fft
-    )
+    # ------------------------------------------------------------------
+    # Non-stream vs stream on the same padded mix
+    # ------------------------------------------------------------------
+    with torch.no_grad():
+        wave_ref = scnet(pad_mix[None])
+        wave_stream = infer_scnet_stream(scnet_stream, pad_mix, hop_size, n_fft)
+
+    wave_ref = wave_ref[..., :orig_len]
+    wave_stream = wave_stream[..., :orig_len]
 
     print(f"[test_full_scnet] non-stream={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
     diff_wave = (wave_stream - wave_ref).abs()
@@ -2851,24 +2811,20 @@ def test_full_scnet():
     separated_music_arrays = {}
     output_sample_rates = {}
     for idx, instrument in enumerate(args.instruments):
-        separated_music_arrays[instrument] = torch.squeeze(output[idx]).detach().cpu().numpy().T
+        separated_music_arrays[instrument] = torch.squeeze(wave_ref[0, idx]).detach().cpu().numpy().T
         output_sample_rates[instrument] = sample_rate
 
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
     save_sources(separated_music_arrays, output_sample_rates, args.save_dir)
 
-    # Also save streaming results trimmed to the original mix length
-    orig_len = mix.shape[-1]
-    output_stream = wave_stream[0, :, :, :orig_len]
     stream_save_dir = args.save_dir + "_stream"
     separated_stream_arrays = {}
     stream_sample_rates = {}
     for idx, instrument in enumerate(args.instruments):
-        separated_stream_arrays[instrument] = torch.squeeze(output_stream[idx]).detach().cpu().numpy().T
+        separated_stream_arrays[instrument] = torch.squeeze(wave_stream[0, idx]).detach().cpu().numpy().T
         stream_sample_rates[instrument] = sample_rate
     save_sources(separated_stream_arrays, stream_sample_rates, stream_save_dir)
-
 
 
 if __name__ == '__main__':
