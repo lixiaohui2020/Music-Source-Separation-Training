@@ -1,22 +1,61 @@
+import os.path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
-# from separationStreamAudioChunk import SeparationNet
+
 from separationStreamConv1dAudioChunk import SeparationNetStream, SeparationNet
-# from separationband import SeparationNet
-# from separationStreamSTFTGRU import SeparationNet
-# from separationStreamSTFTLSTMTimeUniConv1d import SeparationNet
 import typing as tp
 import math
-# import onnx
-# import onnxsim
+import onnx
+import onnxsim
 import numpy as np
-# import parser
-# import argparse
-# import soundfile as sf
-# from scnet.utils import load_model, convert_audio
+# import parser  # removed in Python 3.10+; unused
+import argparse
+import soundfile as sf
+from scnet.apply import apply_model
+from pathlib import Path
+from scnet.utils import convert_audio
 
+# model
+def load_model(model, checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError("No model checkpoint file found at " + str(checkpoint_path))
+
+    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+
+    if 'best_state' not in checkpoint:
+        raise KeyError("Checkpoint does not contain the state")
+
+    state_dict = checkpoint['best_state']
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            new_state_dict[k[7:]] = v
+        else:
+            new_state_dict[k] = v
+
+    model.load_state_dict(new_state_dict)
+    return model
+
+def load_audio(file_path):
+    try:
+        data, sample_rate = sf.read(file_path, dtype='float32')
+        return data, sample_rate
+    except Exception as e:
+        print(f"Error loading audio file {file_path}: {e}")
+        raise
+
+
+def save_sources(sources, output_sample_rates, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    for name, src in sources.items():
+        save_path = os.path.join(save_dir, f'{name}.wav')
+        sf.write(save_path, src, output_sample_rates[name])
+        print(f"Saved {name} to {save_path}")
 
 class Swish(nn.Module):
     def forward(self, x):
@@ -487,6 +526,13 @@ class SCNet(nn.Module):
 
     def forward(self, x):
         # B, C, L = x.shape
+        B = x.shape[0]
+        # In the initial padding, ensure that the number of frames after the STFT (the length of the T dimension) is even,
+        # so that the RFFT operation can be used in the separation network.
+        padding = self.hop_length - x.shape[-1] % self.hop_length
+        if (x.shape[-1] + padding) // self.hop_length % 2 == 0:
+            padding += self.hop_length
+        x = F.pad(x, (0, padding))
 
         # STFT
         L = x.shape[-1]
@@ -497,10 +543,6 @@ class SCNet(nn.Module):
                                           x.shape[1], x.shape[2])
 
         B, C, Fr, T = x.shape
-        # # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
-        # # # std = x.std(dim=(1, 2, 3), keepdim=True)
-        # # # x = (x - mean) / (1e-5 + std)
-        # #
         save_skip = deque()
         save_lengths = deque()
         save_original_lengths = deque()
@@ -529,6 +571,8 @@ class SCNet(nn.Module):
 
         x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device))
         x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+
+        x = x[:, :, :, :-padding]
         return x
 
     def forward_stft(self, x):
@@ -843,6 +887,169 @@ class SCNetNoStft(nn.Module):
 
         return x
 
+class SCNetBandPartialChannel2(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 128],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=6,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_out_window", torch.hann_window(nfft), persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        # self.stft_config = {
+        #     'n_fft': nfft,
+        #     'hop_length': hop_size,
+        #     'win_length': win_size,
+        #     'center': False,
+        #     'normalized': True
+        # }
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblock(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayer(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        # self.separation_net = SeparationNet(
+        #     channels=dims[-1],
+        #     expand=expand,
+        #     num_layers=num_dplayer,
+        # )
+        self.separation_net = SeparationNet(128, 64, 64)
+
+    def forward(self, x):
+        # B, C, L = x.shape
+        # B = x.shape[0]
+        # In the initial padding, ensure that the number of frames after the STFT (the length of the T dimension) is even,
+        # so that the RFFT operation can be used in the separation network.
+        # padding = self.hop_length - x.shape[-1] % self.hop_length
+        # if (x.shape[-1] + padding) // self.hop_length % 2 == 0:
+        #     padding += self.hop_length
+        # x = F.pad(x, (0, padding))
+
+        # STFT
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        # # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        # # # std = x.std(dim=(1, 2, 3), keepdim=True)
+        # # # x = (x - mean) / (1e-5 + std)
+        # #
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # # encoder
+        for sd_layer in self.encoder:
+            x, skip, lengths, original_lengths = sd_layer(x)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = x.transpose(2, 3)
+        x = self.separation_net(x)
+        x = x.transpose(2, 3)
+        #
+        # # decoder
+        for fusion_layer, su_layer in self.decoder:
+            x = fusion_layer(x, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        x = torch.view_as_complex(x.contiguous())
+        # x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device).to(torch.float16))
+
+        x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device))
+        x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+
+        # x = x[:, :, :, :-padding]
+
+        return x
 
 class SCNetStream(nn.Module):
     """
@@ -1786,6 +1993,270 @@ class SCNetStreamNoSTFT(nn.Module):
                 new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv,
                 cache_fus0_out, cache_fus1_out, cache_fus2_out, None)
 
+class SCNetBandPartialChannel2Stream(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 128],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=6,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        # stft parameter
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_window_power", self.stft_window ** 2, persistent=False)
+        rfft_real, rfft_imag = self.create_rfft_matrix(nfft)
+        scale = 1.0 / math.sqrt(nfft)
+        self.scale = scale
+        self.register_buffer("rfft_real", rfft_real.T * scale, persistent=False)
+        self.register_buffer("rfft_imag", rfft_imag.T * scale, persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        irfft_real, irfft_imag = self.create_irfft_matrix(nfft)
+        self.register_buffer("irfft_real", irfft_real.T * scale, persistent=False)
+        self.register_buffer("irfft_imag", irfft_imag.T * scale, persistent=False)
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblockStream(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayerStream(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        # self.separation_net = SeparationNet(
+        #     channels=dims[-1],
+        #     expand=expand,
+        #     num_layers=num_dplayer,
+        # )
+
+        self.separation_net = SeparationNet(128, 64, 64)
+
+    def create_rfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = int(n_fft / 2) + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(1)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(0)
+
+        angle = -2.0 * math.pi * k * n / n_fft
+
+        rfft_real = torch.cos(angle).to(dtype)
+        rfft_imag = torch.sin(angle).to(dtype)
+
+        return rfft_real, rfft_imag
+
+    def create_irfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = n_fft // 2 + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(0)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(1)
+
+        angle = 2.0 * math.pi * k * n / n_fft
+
+        irfft_real = torch.cos(angle).to(dtype)
+        irfft_imag = torch.sin(angle).to(dtype)
+
+        scale = torch.ones(freq_size, dtype=dtype)
+        scale[1:-1] = 2.0
+        irfft_real = irfft_real * scale.unsqueeze(0)
+        irfft_imag = irfft_imag * scale.unsqueeze(0)
+
+        return irfft_real, irfft_imag
+
+    def forward(self, x, cache_stft_in, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, overlap_buffer_in, window_sum_in):
+        # B, C, L = x.shape
+        # B = x.shape[0]
+        # In the initial padding, ensure that the number of frames after the STFT (the length of the T dimension) is even,
+        # so that the RFFT operation can be used in the separation network.
+        # padding = self.hop_length - x.shape[-1] % self.hop_length
+        # if (x.shape[-1] + padding) // self.hop_length % 2 == 0:
+        #     padding += self.hop_length
+        # x = F.pad(x, (0, padding))
+
+        # STFT
+        x = torch.cat([cache_stft_in, x], dim=-1)
+        cache_stft_out = x[:, self.hop_length:]
+        frames_windowed = x * self.stft_window
+        real_part = torch.matmul(frames_windowed, self.rfft_real)
+        imag_part = torch.matmul(frames_windowed, self.rfft_imag)
+
+        x = torch.cat([real_part.unsqueeze(-1), imag_part.unsqueeze(-1)], dim=-1)
+        x = x.unsqueeze(-2)
+        # x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        # # std = x.std(dim=(1, 2, 3), keepdim=True)
+        # # x = (x - mean) / (1e-5 + std)
+        #
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = x.transpose(2, 3)
+        x = self.separation_net(x)
+        x = x.transpose(2, 3)
+        #
+        # decoder
+        icnt = 0
+        for fusion_layer, su_layer in self.decoder:
+            if icnt == 0:
+                x, cache_fus0_out = fusion_layer(x, cache_fus0_in, save_skip.pop())
+            elif icnt == 1:
+                x, cache_fus1_out = fusion_layer(x, cache_fus1_in, save_skip.pop())
+            elif icnt == 2:
+                x, cache_fus2_out = fusion_layer(x, cache_fus2_in, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+            icnt = icnt + 1
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        x = x.squeeze(2)
+        time_frame = torch.matmul(x[..., 0], self.irfft_real) - torch.matmul(x[..., 1], self.irfft_imag)
+        window_frame = time_frame * self.stft_window
+        overlap_buffer_out = overlap_buffer_in + window_frame
+        window_sum_out = window_sum_in + self.stft_window_power
+        window_norm = window_sum_out[..., :self.hop_length]
+        # window_norm = torch.where(window_norm > 1e-8, window_norm, torch.ones_like(window_norm))
+        output = overlap_buffer_out[..., :self.hop_length].clone()
+        x = output / (window_norm + 1e-10)
+        # x = output / window_norm
+        overlap_buffer_out = torch.cat([overlap_buffer_out[..., self.hop_length:],
+                                        torch.zeros([overlap_buffer_in.shape[0], self.hop_length])], dim=-1)
+        window_sum_out = torch.cat([window_sum_out[..., self.hop_length:],
+                                    torch.zeros([window_sum_in.shape[0], self.hop_length])], dim=-1)
+        x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        # cache_stft_out = cache_stft_in
+        # overlap_buffer_out, window_sum_out = overlap_buffer_in, window_sum_in
+        # x = x[:, :, :, :-padding]
+        return (x, cache_stft_out, cache_band0_out, cache_band1_out, cache_band2_out,
+                cache_fus0_out, cache_fus1_out, cache_fus2_out, overlap_buffer_out, window_sum_out)
+
+def test_stft():
+    nfft, hop_length, n = 4096, 1024, 16000
+    torch.manual_seed(42)
+    x = torch.randn([2, n], dtype=torch.float32)
+
+    padding = hop_length - x.shape[-1] % hop_length
+    if (x.shape[-1] + padding) // hop_length % 2 == 0:
+        padding += hop_length
+    x = F.pad(x, (0, padding))
+
+    scnet = SCNet(sources=['accompaniment', 'vocals'])
+    output = scnet(x)
+
+    scnet_stream = SCNetStream(sources=['accompaniment', 'vocals'])
+    cache_stft_state = torch.zeros([2, nfft - hop_length], dtype=torch.float32)
+
+    chunk_size = int(x.shape[-1] / hop_length)
+    stream_output = []
+    for i in range(chunk_size):
+        # input = x[:, i * hop_length:(i + 1) * hop_length]
+        input_chunk = input[..., i * hop_length:(i + 1) * hop_length]
+        chunk_output, cache_stft_state = scnet_stream(input_chunk, cache_stft_state)
+        stream_output.append(chunk_output)
+
+    stream_output = torch.cat(stream_output, dim=-1)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    diff_correct = (stream_output[:, :, 1:] - output.squeeze(0)[:, :, :16]).abs()
+    max_diff_0 = diff_correct[:, :, 0].max().item()
+    mean_diff_0 = diff_correct[:, :, 0].mean().item()
+    max_diff_1 = diff_correct[:, :, 1].max().item()
+    mean_diff_1 = diff_correct[:, :, 1].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+    print(f"Correct vs Ref: max diff = {max_diff_1:.6e}, mean diff = {mean_diff_1:.6e}")
 
 
 def convert_state_dict(src_net, dst_net):
@@ -1799,11 +2270,162 @@ def convert_state_dict(src_net, dst_net):
     dst_net.load_state_dict(new_state_dict)
 
 
+def test_sdlayerbandpartialchannel2_with_onnx():
+    nfft, hop_length, n = 4096, 1024, 16000
+    torch.manual_seed(42)
+    x = torch.randn([2, n], dtype=torch.float32)
+
+    padding = hop_length - x.shape[-1] % hop_length
+    if (x.shape[-1] + padding) // hop_length % 2 == 0:
+        padding += hop_length
+    x = F.pad(x, (0, padding))
+    pad_x = F.pad(x, (hop_length, 0))
+
+    scnet = SCNet(sources=['accompaniment', 'vocals'])
+    scnet.eval()
+    with torch.no_grad():
+        output = scnet(x)
+
+    scnet_stream = SCNetStream(sources=['accompaniment', 'vocals'])
+    convert_state_dict(scnet, scnet_stream)
+
+    scnet_stream.eval()
+    cache_stft_state = torch.zeros([2, nfft - hop_length], dtype=torch.float32)
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1, cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32), torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2, cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32), torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 3], dtype=torch.float32)
+    overlap_buffer_state = torch.zeros([4, 4096], dtype=torch.float32)
+    window_sum_state = torch.zeros([4, 4096], dtype=torch.float32)
+    lookahead = 0
+    state = [cache_stft_state, cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv, lookahead,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state,
+             overlap_buffer_state, window_sum_state]
+    chunk_size = int(x.shape[-1] / hop_length)
+
+    stream_output = []
+    for i in range(chunk_size):
+        with torch.no_grad():
+            input_chunk = x[..., i * hop_length:(i + 1) * hop_length]
+            chunk_output, *state = scnet_stream(input_chunk, *state)
+            if chunk_output is None:
+                continue
+
+        stream_output.append(chunk_output)
+
+    stream_output = torch.cat(stream_output, dim=-1)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    min_len = min(stream_output.shape[-1], output.shape[-1])
+    diff_correct = (stream_output[:, :, :, hop_length * 2:] - output[:, :, :, :min_len - hop_length * 2]).abs()
+    max_diff_0 = diff_correct[:, :, :, :].max().item()
+    mean_diff_0 = diff_correct[:, :, :, :].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+
+def test_stft_op():
+    nfft, win_size, hop_size = 4096, 4096, 1024
+    torch.manual_seed(42)
+    stft_window = torch.hann_window(nfft)
+    center_flag = True
+    stft_config = {
+        'n_fft': nfft,
+        'hop_length': hop_size,
+        'win_length': win_size,
+        'center': center_flag,
+        'normalized': True
+    }
+    torch.manual_seed(42)
+    n = 16000
+    input = torch.randn([2, n], dtype=torch.float32)
+    L = input.shape[-1]
+    stft_x = torch.stft(input , **stft_config, pad_mode='constant', window=stft_window, return_complex=True)
+    output = torch.view_as_real(stft_x)
+    print(output.shape)
+
+    center_flag = False
+    stft_config['center'] = center_flag
+    stft_real = []
+    input_1 = torch.cat([input, torch.zeros([2, hop_size*2], dtype=torch.float32)], dim=-1)
+    cache = torch.zeros([2, hop_size*2], dtype=torch.float32)
+    input_chunk_0 = input_1[:, 0:4*1024]
+    pad_input_chunk0 = torch.cat([cache, input_chunk_0], dim=-1)
+    chunk_stft = torch.stft(pad_input_chunk0, **stft_config, pad_mode='constant', window=stft_window, return_complex=True)
+    cache = pad_input_chunk0[...,3*1024:]
+    stft_real.append(chunk_stft)
+    L = input_1.shape[-1]
+    for i in range(int((L-1024*4)/(1024*3))):
+        start = (i*3+4)*1024
+        end = (i*3+7)*1024
+        chunk = input_1[:, start:end]
+        pad_input_chunk = torch.cat((cache, chunk), dim=-1)
+        cache = pad_input_chunk[:, -hop_size * 3:]
+        chunk_stft = torch.stft(pad_input_chunk, **stft_config, pad_mode='constant', window=stft_window, return_complex=True)
+        stft_real.append(chunk_stft)
+    chunk_end = input_1[:, end:]
+    pad_input_end = torch.cat((cache, chunk_end), dim=-1)
+    # pad_input_end = torch.cat((pad_input_end, torch.zeros([2, hop_size*2], dtype=torch.float32)), dim=-1)
+    chunk_stft = torch.stft(pad_input_end, **stft_config, pad_mode='constant', window=stft_window, return_complex=True)
+    stft_real.append(chunk_stft)
+    stft_real = torch.cat(stft_real, dim=-1)
+    output_real = torch.view_as_real(stft_real)
+    print(output_real.shape)
+
+    min_len = min(output_real.shape[-2], output_real.shape[-1])
+    diff = output[:,:,:min_len, :] - output_real[:,:,:min_len, :]
+    print("max diff: ", diff.abs().max())
+
+def test_istft_op():
+    nfft, win_size, hop_size = 4096, 4096, 1024
+    torch.manual_seed(42)
+    stft_window = torch.hann_window(nfft)
+    stft_window = stft_window
+    center_flag = True
+    stft_config = {
+        'n_fft': nfft,
+        'hop_length': hop_size,
+        'win_length': win_size,
+        'center': center_flag,
+        'normalized': True
+    }
+    torch.manual_seed(42)
+    n = 16
+    input = torch.randn([2049, 16, 2], dtype=torch.float32)
+    L = input.shape[-2]
+    input_cmpx = torch.view_as_complex(input)
+    istft_out = torch.istft(input_cmpx , **stft_config, window=stft_window)
+
+    center_flag = False
+    stft_config['center'] = center_flag
+    conj_index = torch.arange(nfft/2-1, 0, -1).int()
+    L_temp = (L-1)*hop_size + win_size
+    signal_acc = torch.zeros(L_temp, dtype=torch.float32)
+    weight_acc = torch.zeros(L_temp, dtype=torch.float32)
+    window_sq = stft_window ** 2
+    for i in range(int((L))):
+        input_cmpx_chunk = input_cmpx[:, i]
+        input_cmpx_chunk_full =  torch.cat([input_cmpx_chunk, torch.conj(input_cmpx_chunk[conj_index])]) * 64
+        y = torch.fft.ifft(input_cmpx_chunk_full).real
+        y_win = y * stft_window
+        start = i * hop_size
+        signal_acc[start:start + nfft] += y_win
+        weight_acc[start:start + nfft] += window_sq
+
+    output = signal_acc / (weight_acc + 1e-8)
+    diff = output[2048:-2048] - istft_out
+    print('max diff:', diff.abs().max())
+    print('mean diff:', diff.mean())
 
 def test_scnet_nostft():
-    B, C, Freq, T = 1, 4, 2049, 18
+    B, C, F, T = 1, 4, 2049, 18
     torch.manual_seed(42)
-    x = torch.randn([B, C, Freq, T], dtype=torch.float32)
+    x = torch.randn([B, C, F, T], dtype=torch.float32)
 
     scnet = SCNetNoStft(sources=['accompaniment', 'vocals'])
     scnet.eval()
@@ -1848,39 +2470,28 @@ def test_scnet_nostft():
     mean_diff_0 = diff_correct[:, :, :, :].mean().item()
     print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
 
-    # ------------------------------------------------------------------
-    # Part2: 在 nostft 流式基础上加 STFT / ISTFT，与完整 SCNet 波形对齐
-    # STFT: center=True, pad_mode='constant'  <=>  左右各补 n_fft//2 零 + center=False
-    # ------------------------------------------------------------------
-    hop_size, n_fft, T = 1024, 4096, 16000
+def test_scnet_noistft():
+    hop_size, T = 1024, 16000
     torch.manual_seed(42)
     input = torch.randn([2, T], dtype=torch.float32)
 
-    # 使 center=True 的帧数 T_frames = 1 + L/hop 能被 3 整除（lookahead=3）
-    padding = (hop_size - input.shape[-1] % hop_size) % hop_size
-    l_tmp = input.shape[-1] + padding
-    t_frames = 1 + l_tmp // hop_size
-    padding += ((3 - t_frames % 3) % 3) * hop_size
+    padding = hop_size*3 - (input.shape[-1]-4096) % (hop_size*3)
+    if (input.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
     pad_input = F.pad(input, (0, padding))
     L = pad_input.shape[-1]
 
-    # 离线完整 SCNet（内部 STFT + 模型 + ISTFT）
-    scnet = SCNet(sources=['accompaniment', 'vocals'])
+    scnet = SCNetNoISTFT(sources=['accompaniment', 'vocals'])
     scnet.eval()
     with torch.no_grad():
-        wave_ref = scnet(pad_input)
-
-    # 频谱域对照（可选）：SCNetNoISTFT
-    scnet_spec = SCNetNoISTFT(sources=['accompaniment', 'vocals'])
-    convert_state_dict(scnet, scnet_spec)
-    scnet_spec.eval()
-    with torch.no_grad():
-        spec_ref = scnet_spec(pad_input)
+        output = scnet(pad_input)
 
     scnet_stream = SCNetStreamNoSTFT(sources=['accompaniment', 'vocals'])
     convert_state_dict(scnet, scnet_stream)
-    scnet_stream.eval()
 
+    scnet_stream.eval()
+    cache_stft_0 = torch.zeros([2, 2*hop_size], dtype=torch.float32)
+    cache_stft_1 = torch.zeros([2, 3*hop_size], dtype=torch.float32)
     cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
     cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
     cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
@@ -1895,43 +2506,201 @@ def test_scnet_nostft():
              cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
              cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
 
-    # 右端 constant pad（与 torch.stft center=True, pad_mode='constant' 一致）
-    # 左端用 cache_stft_0 = zeros(2*hop) 模拟
-    pad_input_ext = F.pad(pad_input, (0, 2 * hop_size))
-    L_ext = pad_input_ext.shape[-1]
-    cache_stft_0 = torch.zeros([2, 2 * hop_size], dtype=torch.float32)
+    stream_output = []
+    scnet_stream.stft_config['center'] = False
+    with torch.no_grad():
+        input_chunk = pad_input[..., 0:hop_size*4]
+        stft_x = torch.stft(torch.cat([cache_stft_0, input_chunk], dim=-1), **scnet_stream.stft_config, window=scnet_stream.stft_window, return_complex=True)
+        x = torch.view_as_real(stft_x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // 2, x.shape[3] * 2,
+                                          x.shape[1], x.shape[2])
+        _, *state = scnet_stream.forward_1st_frame(x, *state)
+        cache_stft_0 = input_chunk[:, -3*hop_size:]
+        for i in range(int((L-1024*4)/(3*1024))):
+            start = (i*3+4) * hop_size
+            end = (i*3+7) * hop_size
+            input_chunk = pad_input[..., start:end]
+            stft_x = torch.stft(torch.cat([cache_stft_0, input_chunk], dim=-1), **scnet_stream.stft_config,
+                                window=scnet_stream.stft_window, return_complex=True)
+            x = torch.view_as_real(stft_x)
+            x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // 2, x.shape[3] * 2,
+                                              x.shape[1], x.shape[2])
+            cache_stft_0 = input_chunk
+            chunk_output, *state = scnet_stream(x, *state)
+            stream_output.append(chunk_output)
+        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        stream_output.append(chunk_output)
+    stream_output = torch.cat(stream_output, dim=-2)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    min_len = min(stream_output.shape[-2], output.shape[-2])
+    diff_correct = (stream_output[:, :, :min_len, :] - output[:, :, :min_len, :]).abs()
+    max_diff_0 = diff_correct[:, :, :, :].max().item()
+    mean_diff_0 = diff_correct[:, :, :, :].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+
+
+def test_scnet_stft_stream():
+    nfft, win_size, hop_size, n = 4096, 4096, 1024, 16000
+    torch.manual_seed(42)
+    x = torch.randn([2, n], dtype=torch.float32)
+
+    padding = hop_size - x.shape[-1] % hop_size
+    if (x.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    x = F.pad(x, (0, padding))
+    L = x.shape[-1]
+
+    scnet = SCNetNoISTFT(sources=['accompaniment', 'vocals'])
+    scnet.eval()
+    with torch.no_grad():
+        output = scnet(x)
+
+    scnet_stream = SCNetStreamNoISTFT(sources=['accompaniment', 'vocals'])
+    convert_state_dict(scnet, scnet_stream)
+
+    scnet_stream.eval()
+    cache_stft_0 = torch.zeros([2, hop_size*2], dtype=torch.float32)
+    cache_stft_1 = torch.zeros([2, hop_size*2], dtype=torch.float32)
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1, cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32), torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2, cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32), torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32)
+    save_skip = None
+    state = [cache_stft_0, cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
 
     stream_output = []
+    with torch.no_grad():
+        input_chunk = x[..., 0:4*hop_size]
+        _, *state = scnet_stream.forward_1st_frame(input_chunk, *state)
+        for i in range(int((L-1024*4) / 3072) - 1):
+            input_chunk = x[..., (i + 1) * 3:(i + 2) * 3]
+            chunk_output, *state = scnet_stream(input_chunk, *state)
+            stream_output.append(chunk_output)
+        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        stream_output.append(chunk_output)
+    stream_output = torch.cat(stream_output, dim=-2)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    min_len = min(stream_output.shape[-2], output.shape[-2])
+    diff_correct = (stream_output[:, :, :min_len, :] - output[:, :, :min_len, :]).abs()
+    max_diff_0 = diff_correct[:, :, :, :].max().item()
+    mean_diff_0 = diff_correct[:, :, :, :].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+
+def test_scnet():
+    # ------------------------------------------------------------------
+    # 在 nostft 流式基础上加 STFT / ISTFT，与完整 SCNet 波形对齐
+    # STFT: center=True, pad_mode='constant'  <=>  左右各补 n_fft//2 零 + center=False
+    # 流式输入长度需与 SCNet.forward 内部 hop pad 后的长度一致（见 infer_scnet_stream_aligned）
+    # ------------------------------------------------------------------
+    hop_size, n_fft, T = 1024, 4096, 16000
+    torch.manual_seed(42)
+    input = torch.randn([2, T], dtype=torch.float32)
+
+    scnet = SCNet(sources=['accompaniment', 'vocals'])
+    scnet.eval()
+    scnet_stream = SCNetStreamNoSTFT(sources=['accompaniment', 'vocals'])
+    convert_state_dict(scnet, scnet_stream)
+    scnet_stream.eval()
+
+    wave_ref, wave_stream, pad_input = infer_scnet_stream_aligned(
+        scnet, scnet_stream, input, hop_size, n_fft
+    )
+
+    print(f"[STFT+nostft+OLA_ISTFT] wave_ref={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
+    diff_wave = (wave_stream - wave_ref).abs()
+    print(f"[STFT+nostft+OLA_ISTFT] max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
+
+
+def pad_mix_for_stream(mix, hop_size=1024):
+    """
+    Pad mix so that after SCNet.forward's internal hop padding, the STFT
+    frame count T_frames = 1 + L_internal/hop is divisible by 3 (lookahead).
+
+    Returns (pad_input, extra_pad) where pad_input is fed to SCNet; the stream
+    path should further apply the same internal SCNet pad before inferring.
+    """
+    L0 = mix.shape[-1]
+    extra = 0
+    while True:
+        L = L0 + extra
+        scnet_pad = hop_size - (L % hop_size)
+        if (L + scnet_pad) // hop_size % 2 == 0:
+            scnet_pad += hop_size
+        t_frames = 1 + (L + scnet_pad) // hop_size
+        if t_frames % 3 == 0:
+            break
+        extra += hop_size
+    return F.pad(mix, (0, extra)), extra
+
+
+def scnet_internal_pad(wave, hop_size=1024):
+    """Replicate SCNet.forward hop padding (before STFT)."""
+    padding = hop_size - wave.shape[-1] % hop_size
+    if (wave.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    return F.pad(wave, (0, padding)), padding
+
+
+def infer_scnet_stream(scnet_stream, pad_input, hop_size=1024, n_fft=4096):
+    """
+    Streaming STFT + SCNetStreamNoSTFT + OLA ISTFT.
+
+    Same logic as test_scnet(). pad_input must already be padded so that
+    T_frames = 1 + L/hop is divisible by 3. Shape: [C, L] (C=2).
+    Returns waveform with shape [1, S, C, L].
+    """
+    L = pad_input.shape[-1]
+    n_ola = len(scnet_stream.sources) * scnet_stream.audio_channels
+
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32, device=pad_input.device)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32, device=pad_input.device)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32, device=pad_input.device)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32, device=pad_input.device)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32, device=pad_input.device)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32, device=pad_input.device)
+    cache_h1 = torch.zeros([1, 57, 64], dtype=torch.float32, device=pad_input.device)
+    cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32, device=pad_input.device)
+    cache_h2 = torch.zeros([1, 57, 128], dtype=torch.float32, device=pad_input.device)
+    cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32, device=pad_input.device)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32, device=pad_input.device)
+    save_skip = None
+    state = [cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
+
+    pad_input_ext = F.pad(pad_input, (0, 2 * hop_size))
+    L_ext = pad_input_ext.shape[-1]
+    cache_stft_0 = torch.zeros([pad_input.shape[0], 2 * hop_size], dtype=pad_input.dtype, device=pad_input.device)
+
     wave_chunks = []
-    # 流式 OLA ISTFT：只用小型 overlap 状态 + torch.fft.irfft 批量反变换
-    # 不再使用 irfft_real/irfft_imag 大矩阵，也不再逐帧 Python 循环 matmul
-    n_ola = len(scnet.sources) * scnet.audio_channels  # 4
-    overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
-    window_sum = torch.zeros([n_fft], dtype=torch.float32)
+    overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32, device=pad_input.device)
+    window_sum = torch.zeros([n_fft], dtype=torch.float32, device=pad_input.device)
     win = scnet_stream.stft_window
     win_pow = win * win
-    fft_scale = n_fft ** 0.5  # 对齐 normalized=True 的 ISTFT 幅度
+    fft_scale = n_fft ** 0.5
 
     def push_ola_istft(spec_rt):
-        """
-        高效流式 ISTFT。
-        spec_rt: (N, F, T_new, 2) → (N, T_new * hop)
-        - irfft 对 T_new 帧一次批处理
-        - fold 做 overlap-add
-        - 状态仅保留 (N, n_fft) / (n_fft,) 的尾部缓冲
-        """
         nonlocal overlap_buffer, window_sum
         n, _, t_new, _ = spec_rt.shape
         if t_new == 0:
             return torch.zeros(n, 0, dtype=spec_rt.dtype, device=spec_rt.device)
 
-        # (N, T, F) complex → (N, T, n_fft)
         spec_c = torch.view_as_complex(spec_rt.permute(0, 2, 1, 3).contiguous())
         frames = torch.fft.irfft(spec_c, n=n_fft, dim=-1).mul_(fft_scale)
-        frames.mul_(win)  # (N, T, n_fft)
+        frames.mul_(win)
 
         ola_len = n_fft + (t_new - 1) * hop_size
-        # fold: (N, n_fft, T) → (N, 1, ola_len)
         frames_nct = frames.transpose(1, 2).contiguous()
         ola = F.fold(
             frames_nct,
@@ -1952,17 +2721,33 @@ def test_scnet_nostft():
 
         out_len = t_new * hop_size
         out = ola[:, :out_len] / (wola[:out_len] + 1e-10)
-
-        # 尾部回写为下一包的 overlap 状态（长度仍为 n_fft）
         overlap_buffer = F.pad(ola[:, out_len:], (0, hop_size))
         window_sum = F.pad(wola[out_len:], (0, hop_size))
         return out
 
     stft_cfg = dict(scnet_stream.stft_config)
-    stft_cfg['center'] = False  # 左右 pad 已手工加上
-    with torch.no_grad():
-        # 首包: 左零填(2hop) + 4hop 音频 -> 3 帧，只填 lookahead（尚无模型输出）
-        input_chunk = pad_input_ext[..., 0:hop_size * 4]
+    stft_cfg['center'] = False
+
+    # first chunk: warmup lookahead only
+    input_chunk = pad_input_ext[..., 0:hop_size * 4]
+    stft_x = torch.stft(
+        torch.cat([cache_stft_0, input_chunk], dim=-1),
+        **stft_cfg,
+        window=scnet_stream.stft_window,
+        return_complex=True,
+    )
+    x = torch.view_as_real(stft_x)
+    x = x.permute(0, 3, 1, 2).reshape(
+        x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
+    )
+    _, *state = scnet_stream.forward_1st_frame(x, *state)
+    cache_stft_0 = input_chunk[:, -3 * hop_size:]
+
+    n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+    for i in range(n_mid):
+        start = (i * 3 + 4) * hop_size
+        end = (i * 3 + 7) * hop_size
+        input_chunk = pad_input_ext[..., start:end]
         stft_x = torch.stft(
             torch.cat([cache_stft_0, input_chunk], dim=-1),
             **stft_cfg,
@@ -1973,56 +2758,125 @@ def test_scnet_nostft():
         x = x.permute(0, 3, 1, 2).reshape(
             x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
         )
-        _, *state = scnet_stream.forward_1st_frame(x, *state)
-        cache_stft_0 = input_chunk[:, -3 * hop_size:]
-
-        # 中间包: 每次 3hop -> 3 帧；模型一有输出就立刻 OLA ISTFT
-        n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
-        for i in range(n_mid):
-            start = (i * 3 + 4) * hop_size
-            end = (i * 3 + 7) * hop_size
-            input_chunk = pad_input_ext[..., start:end]
-            stft_x = torch.stft(
-                torch.cat([cache_stft_0, input_chunk], dim=-1),
-                **stft_cfg,
-                window=scnet_stream.stft_window,
-                return_complex=True,
-            )
-            x = torch.view_as_real(stft_x)
-            x = x.permute(0, 3, 1, 2).reshape(
-                x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
-            )
-            cache_stft_0 = input_chunk
-            chunk_output, *state = scnet_stream(x, *state)
-            stream_output.append(chunk_output)
-            wave_chunks.append(push_ola_istft(chunk_output))
-
-        # flush lookahead，并立刻 ISTFT
-        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
-        stream_output.append(chunk_output)
+        cache_stft_0 = input_chunk
+        chunk_output, *state = scnet_stream(x, *state)
         wave_chunks.append(push_ola_istft(chunk_output))
 
-        # center=True 还需要再吐 1 个 hop，才能凑齐 length=L（见右端 pad）
-        wave_chunks.append(
-            overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
-        )
+    chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+    wave_chunks.append(push_ola_istft(chunk_output))
+    wave_chunks.append(
+        overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+    )
 
-    stream_output = torch.cat(stream_output, dim=-2)  # (N, F, T, 2)
-
-    # OLA 时间轴含左 pad，去掉 n_fft//2 后取 L（对齐 torch.istft center=True, length=L）
     wave_ola = torch.cat(wave_chunks, dim=-1)
     pad = n_fft // 2
-    wave_stream = wave_ola[:, pad:pad + L].reshape(wave_ref.shape)
+    return wave_ola[:, pad:pad + L].reshape(
+        1, len(scnet_stream.sources), scnet_stream.audio_channels, L
+    )
 
-    print(f"[STFT+nostft] spec_ref={tuple(spec_ref.shape)}, stream={tuple(stream_output.shape)}")
-    min_len = min(stream_output.shape[-2], spec_ref.shape[-2])
-    diff_spec = (stream_output[:, :, :min_len, :] - spec_ref[:, :, :min_len, :]).abs()
-    print(f"[STFT+nostft] max diff = {diff_spec.max().item():.6e}, mean diff = {diff_spec.mean().item():.6e}")
 
-    print(f"[STFT+nostft+OLA_ISTFT] wave_ref={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
+def infer_scnet_stream_aligned(scnet, scnet_stream, mix, hop_size=1024, n_fft=4096):
+    """
+    Run non-stream SCNet and streaming SCNet on the same mix with matched padding.
+
+    Returns (wave_ref, wave_stream, pad_input) both shaped [1, S, C, L_pad],
+    trimmed to the length SCNet returns (after its internal pad/trim).
+    """
+    pad_input, _ = pad_mix_for_stream(mix, hop_size)
+    stream_input, scnet_pad = scnet_internal_pad(pad_input, hop_size)
+    with torch.no_grad():
+        wave_ref = scnet(pad_input)
+        wave_stream_full = infer_scnet_stream(scnet_stream, stream_input, hop_size, n_fft)
+        # SCNet trims its internal pad; keep the same region from the stream output
+        wave_stream = wave_stream_full[..., :pad_input.shape[-1]]
+    return wave_ref, wave_stream, pad_input
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Music Source Separation using SCNet")
+    parser.add_argument('--input_dir', type=str,
+                        default='/home/data1/lixiaohui/_Codes/_Python/001_audio/'
+                                'source_separation/demucs_master/demucs/data/'
+                                '2026-02-02/wav/LBI利比（时柏尘） - 小城夏天_215613356.wav',
+                        # default='/home/data1/lixiaohui/_Data/002_source_separation/source/Test/20260330/wav',
+                        help='Input directory containing audio files')
+    parser.add_argument('--output_dir', type=str,
+                        default='../output/scnet_subchannel_MusdbhqMoisedbDsdCCMixterClean_lr3e-4_normTrue_2cls_streamSTFT64-128-64-LSTMTimeUniLastConv1dDplayer2_noscalar_pre103_adjustlr/',
+                        help='Output directory to save separated sources')
+    parser.add_argument('--checkpoint_path', type=str,
+                        default='../result/scnet_subchannel_MusdbhqMoisedbDsdCCMixterClean_lr3e-4_normTrue_2cls_streamSTFT64-128-64-LSTMTimeUniLastConv1dDplayer2_noscalar_pre103_adjustlr/checkpoint_69.th',
+                        help='Path to model checkpoint file')
+    parser.add_argument('--instruments', type=str,
+                        default=['accompaniment', 'vocals'],
+                        help='Path to model checkpoint file')
+    parser.add_argument('--save_dir', type=str,
+                        default="./output/小城夏天_215613356",
+                        help='Path to model checkpoint file')
+    return parser.parse_args()
+
+def test_full_scnet():
+    args = parse_args()
+    scnet = SCNet(args.instruments)
+    scnet = load_model(scnet, args.checkpoint_path)
+    scnet.eval()
+
+    audio_data, sample_rate = load_audio(args.input_dir)
+    mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
+    mix = convert_audio(mix, sample_rate, sample_rate, 2)
+
+    # ------------------------------------------------------------------
+    # Non-stream inference (unchanged): model load / data load / apply_model
+    # ------------------------------------------------------------------
+    with torch.no_grad():
+        output = apply_model(scnet, mix[None], shifts=1, split=True, overlap=0.5, progress=False)[0]
+        # output = None
+
+    # ------------------------------------------------------------------
+    # Stream inference: same weights, padding matched to SCNet.forward
+    # ------------------------------------------------------------------
+    hop_size, n_fft = 1024, 4096
+    scnet_stream = SCNetStreamNoSTFT(sources=list(args.instruments))
+    convert_state_dict(scnet, scnet_stream)
+    scnet_stream.eval()
+
+    wave_ref, wave_stream, pad_input = infer_scnet_stream_aligned(
+        scnet, scnet_stream, mix, hop_size, n_fft
+    )
+
+    print(f"[test_full_scnet] non-stream={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
     diff_wave = (wave_stream - wave_ref).abs()
-    print(f"[STFT+nostft+OLA_ISTFT] max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
+    print(f"[test_full_scnet] stream vs non-stream: "
+          f"max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
+
+    separated_music_arrays = {}
+    output_sample_rates = {}
+    for idx, instrument in enumerate(args.instruments):
+        separated_music_arrays[instrument] = torch.squeeze(output[idx]).detach().cpu().numpy().T
+        output_sample_rates[instrument] = sample_rate
+
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+    save_sources(separated_music_arrays, output_sample_rates, args.save_dir)
+
+    # Also save streaming results trimmed to the original mix length
+    orig_len = mix.shape[-1]
+    output_stream = wave_stream[0, :, :, :orig_len]
+    stream_save_dir = args.save_dir + "_stream"
+    separated_stream_arrays = {}
+    stream_sample_rates = {}
+    for idx, instrument in enumerate(args.instruments):
+        separated_stream_arrays[instrument] = torch.squeeze(output_stream[idx]).detach().cpu().numpy().T
+        stream_sample_rates[instrument] = sample_rate
+    save_sources(separated_stream_arrays, stream_sample_rates, stream_save_dir)
+
 
 
 if __name__ == '__main__':
-    test_scnet_nostft()
+    test_full_scnet()
+    # test_scnet()
+    # test_scnet_noistft()
+    # test_scnet_stft_stream()
+    # test_istft_op()
+    # test_stft_op()
+    # test_scnet_nostft()
+    # test_sdlayerbandpartialchannel2_with_onnx()
