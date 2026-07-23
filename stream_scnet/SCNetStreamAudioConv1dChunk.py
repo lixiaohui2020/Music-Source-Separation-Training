@@ -2597,61 +2597,35 @@ def test_scnet():
     torch.manual_seed(42)
     input = torch.randn([2, T], dtype=torch.float32)
 
+    # hop 对齐 + 流式 lookahead=3：T_frames = 1 + L/hop 需为奇数且能被 3 整除
+    padding = hop_size - input.shape[-1] % hop_size
+    if (input.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    L = input.shape[-1] + padding
+    t_frames = 1 + L // hop_size
+    if t_frames % 3 != 0:
+        padding += ((3 - t_frames % 3) % 3) * hop_size
+    pad_input = F.pad(input, (0, padding))
+    L = pad_input.shape[-1]
+
     scnet = SCNet(sources=['accompaniment', 'vocals'])
     scnet.eval()
+    with torch.no_grad():
+        wave_ref = scnet(pad_input[None])
+
     scnet_stream = SCNetStreamNoSTFT(sources=['accompaniment', 'vocals'])
     convert_state_dict(scnet, scnet_stream)
     scnet_stream.eval()
 
-    pad_mix, _ = pad_mix_for_scnet(input, hop_size)
-    with torch.no_grad():
-        wave_ref = scnet(pad_mix[None])
-        wave_stream = infer_scnet_stream(scnet_stream, pad_mix, hop_size, n_fft)
-
-    print(f"[STFT+nostft+OLA_ISTFT] wave_ref={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
-    diff_wave = (wave_stream - wave_ref).abs()
-    print(f"[STFT+nostft+OLA_ISTFT] max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
-
-
-def pad_mix_for_scnet(mix, hop_size=1024):
-    """
-    Pad mix once for both non-stream SCNet and streaming inference.
-
-    - hop alignment: STFT frame count must be odd (center=True => T = 1 + L/hop)
-    - stream alignment: T must be divisible by 3 (lookahead=3)
-    """
-    padding = hop_size - mix.shape[-1] % hop_size
-    if (mix.shape[-1] + padding) // hop_size % 2 == 0:
-        padding += hop_size
-    L = mix.shape[-1] + padding
-    t_frames = 1 + L // hop_size
-    if t_frames % 3 != 0:
-        padding += ((3 - t_frames % 3) % 3) * hop_size
-    return F.pad(mix, (0, padding)), padding
-
-
-def infer_scnet_stream(scnet_stream, pad_input, hop_size=1024, n_fft=4096):
-    """
-    Streaming STFT + SCNetStreamNoSTFT + OLA ISTFT.
-
-    Same logic as test_scnet(). pad_input must already be padded so that
-    T_frames = 1 + L/hop is divisible by 3. Shape: [C, L] (C=2).
-    Returns waveform with shape [1, S, C, L].
-    """
-    L = pad_input.shape[-1]
-    n_ola = len(scnet_stream.sources) * scnet_stream.audio_channels
-
-    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32, device=pad_input.device)
-    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32, device=pad_input.device)
-    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32, device=pad_input.device)
-    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32, device=pad_input.device)
-    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32, device=pad_input.device)
-    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32, device=pad_input.device)
-    cache_h1 = torch.zeros([1, 57, 64], dtype=torch.float32, device=pad_input.device)
-    cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32, device=pad_input.device)
-    cache_h2 = torch.zeros([1, 57, 128], dtype=torch.float32, device=pad_input.device)
-    cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32, device=pad_input.device)
-    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32, device=pad_input.device)
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1, cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32), torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2, cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32), torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32)
     save_skip = None
     state = [cache_band0_state, cache_band1_state, cache_band2_state,
              cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
@@ -2659,11 +2633,12 @@ def infer_scnet_stream(scnet_stream, pad_input, hop_size=1024, n_fft=4096):
 
     pad_input_ext = F.pad(pad_input, (0, 2 * hop_size))
     L_ext = pad_input_ext.shape[-1]
-    cache_stft_0 = torch.zeros([pad_input.shape[0], 2 * hop_size], dtype=pad_input.dtype, device=pad_input.device)
+    cache_stft_0 = torch.zeros([2, 2 * hop_size], dtype=torch.float32)
 
     wave_chunks = []
-    overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32, device=pad_input.device)
-    window_sum = torch.zeros([n_fft], dtype=torch.float32, device=pad_input.device)
+    n_ola = len(scnet.sources) * scnet.audio_channels
+    overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
+    window_sum = torch.zeros([n_fft], dtype=torch.float32)
     win = scnet_stream.stft_window
     win_pow = win * win
     fft_scale = n_fft ** 0.5
@@ -2673,30 +2648,22 @@ def infer_scnet_stream(scnet_stream, pad_input, hop_size=1024, n_fft=4096):
         n, _, t_new, _ = spec_rt.shape
         if t_new == 0:
             return torch.zeros(n, 0, dtype=spec_rt.dtype, device=spec_rt.device)
-
         spec_c = torch.view_as_complex(spec_rt.permute(0, 2, 1, 3).contiguous())
         frames = torch.fft.irfft(spec_c, n=n_fft, dim=-1).mul_(fft_scale)
         frames.mul_(win)
-
         ola_len = n_fft + (t_new - 1) * hop_size
         frames_nct = frames.transpose(1, 2).contiguous()
         ola = F.fold(
-            frames_nct,
-            output_size=(1, ola_len),
-            kernel_size=(1, n_fft),
-            stride=(1, hop_size),
+            frames_nct, output_size=(1, ola_len),
+            kernel_size=(1, n_fft), stride=(1, hop_size),
         ).reshape(n, ola_len)
         ola[:, :n_fft] += overlap_buffer
-
         w_frames = win_pow.view(1, n_fft, 1).expand(1, n_fft, t_new)
         wola = F.fold(
-            w_frames,
-            output_size=(1, ola_len),
-            kernel_size=(1, n_fft),
-            stride=(1, hop_size),
+            w_frames, output_size=(1, ola_len),
+            kernel_size=(1, n_fft), stride=(1, hop_size),
         ).reshape(ola_len)
         wola[:n_fft] += window_sum
-
         out_len = t_new * hop_size
         out = ola[:, :out_len] / (wola[:out_len] + 1e-10)
         overlap_buffer = F.pad(ola[:, out_len:], (0, hop_size))
@@ -2705,52 +2672,49 @@ def infer_scnet_stream(scnet_stream, pad_input, hop_size=1024, n_fft=4096):
 
     stft_cfg = dict(scnet_stream.stft_config)
     stft_cfg['center'] = False
-
-    # first chunk: warmup lookahead only
-    input_chunk = pad_input_ext[..., 0:hop_size * 4]
-    stft_x = torch.stft(
-        torch.cat([cache_stft_0, input_chunk], dim=-1),
-        **stft_cfg,
-        window=scnet_stream.stft_window,
-        return_complex=True,
-    )
-    x = torch.view_as_real(stft_x)
-    x = x.permute(0, 3, 1, 2).reshape(
-        x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
-    )
-    _, *state = scnet_stream.forward_1st_frame(x, *state)
-    cache_stft_0 = input_chunk[:, -3 * hop_size:]
-
-    n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
-    for i in range(n_mid):
-        start = (i * 3 + 4) * hop_size
-        end = (i * 3 + 7) * hop_size
-        input_chunk = pad_input_ext[..., start:end]
+    with torch.no_grad():
+        input_chunk = pad_input_ext[..., 0:hop_size * 4]
         stft_x = torch.stft(
             torch.cat([cache_stft_0, input_chunk], dim=-1),
-            **stft_cfg,
-            window=scnet_stream.stft_window,
-            return_complex=True,
+            **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
         )
         x = torch.view_as_real(stft_x)
         x = x.permute(0, 3, 1, 2).reshape(
             x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
         )
-        cache_stft_0 = input_chunk
-        chunk_output, *state = scnet_stream(x, *state)
-        wave_chunks.append(push_ola_istft(chunk_output))
+        _, *state = scnet_stream.forward_1st_frame(x, *state)
+        cache_stft_0 = input_chunk[:, -3 * hop_size:]
 
-    chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
-    wave_chunks.append(push_ola_istft(chunk_output))
-    wave_chunks.append(
-        overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
-    )
+        n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+        for i in range(n_mid):
+            start = (i * 3 + 4) * hop_size
+            end = (i * 3 + 7) * hop_size
+            input_chunk = pad_input_ext[..., start:end]
+            stft_x = torch.stft(
+                torch.cat([cache_stft_0, input_chunk], dim=-1),
+                **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
+            )
+            x = torch.view_as_real(stft_x)
+            x = x.permute(0, 3, 1, 2).reshape(
+                x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
+            )
+            cache_stft_0 = input_chunk
+            chunk_output, *state = scnet_stream(x, *state)
+            wave_chunks.append(push_ola_istft(chunk_output))
+
+        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        wave_chunks.append(push_ola_istft(chunk_output))
+        wave_chunks.append(
+            overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+        )
 
     wave_ola = torch.cat(wave_chunks, dim=-1)
     pad = n_fft // 2
-    return wave_ola[:, pad:pad + L].reshape(
-        1, len(scnet_stream.sources), scnet_stream.audio_channels, L
-    )
+    wave_stream = wave_ola[:, pad:pad + L].reshape(wave_ref.shape)
+
+    print(f"[STFT+nostft+OLA_ISTFT] wave_ref={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
+    diff_wave = (wave_stream - wave_ref).abs()
+    print(f"[STFT+nostft+OLA_ISTFT] max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
 
 
 def parse_args():
@@ -2787,19 +2751,129 @@ def test_full_scnet():
     orig_len = mix.shape[-1]
 
     hop_size, n_fft = 1024, 4096
-    pad_mix, _ = pad_mix_for_scnet(mix, hop_size)
+
+    # pad：hop 对齐（帧数为奇数）+ 流式 lookahead=3（帧数能被 3 整除）
+    padding = hop_size - mix.shape[-1] % hop_size
+    if (mix.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    L = mix.shape[-1] + padding
+    t_frames = 1 + L // hop_size
+    if t_frames % 3 != 0:
+        padding += ((3 - t_frames % 3) % 3) * hop_size
+    pad_mix = F.pad(mix, (0, padding))
+    L = pad_mix.shape[-1]
 
     scnet_stream = SCNetStreamNoSTFT(sources=list(args.instruments))
     convert_state_dict(scnet, scnet_stream)
     scnet_stream.eval()
 
     # ------------------------------------------------------------------
-    # Non-stream vs stream on the same padded mix
+    # 非流式
     # ------------------------------------------------------------------
     with torch.no_grad():
         wave_ref = scnet(pad_mix[None])
-        wave_stream = infer_scnet_stream(scnet_stream, pad_mix, hop_size, n_fft)
 
+    # ------------------------------------------------------------------
+    # 流式：STFT + SCNetStreamNoSTFT + OLA ISTFT
+    # ------------------------------------------------------------------
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1 = torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2 = torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32)
+    save_skip = None
+    state = [cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
+
+    pad_mix_ext = F.pad(pad_mix, (0, 2 * hop_size))
+    L_ext = pad_mix_ext.shape[-1]
+    cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
+
+    wave_chunks = []
+    n_ola = len(scnet_stream.sources) * scnet_stream.audio_channels
+    overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
+    window_sum = torch.zeros([n_fft], dtype=torch.float32)
+    win = scnet_stream.stft_window
+    win_pow = win * win
+    fft_scale = n_fft ** 0.5
+
+    def push_ola_istft(spec_rt):
+        nonlocal overlap_buffer, window_sum
+        n, _, t_new, _ = spec_rt.shape
+        if t_new == 0:
+            return torch.zeros(n, 0, dtype=spec_rt.dtype, device=spec_rt.device)
+        spec_c = torch.view_as_complex(spec_rt.permute(0, 2, 1, 3).contiguous())
+        frames = torch.fft.irfft(spec_c, n=n_fft, dim=-1).mul_(fft_scale)
+        frames.mul_(win)
+        ola_len = n_fft + (t_new - 1) * hop_size
+        frames_nct = frames.transpose(1, 2).contiguous()
+        ola = F.fold(
+            frames_nct, output_size=(1, ola_len),
+            kernel_size=(1, n_fft), stride=(1, hop_size),
+        ).reshape(n, ola_len)
+        ola[:, :n_fft] += overlap_buffer
+        w_frames = win_pow.view(1, n_fft, 1).expand(1, n_fft, t_new)
+        wola = F.fold(
+            w_frames, output_size=(1, ola_len),
+            kernel_size=(1, n_fft), stride=(1, hop_size),
+        ).reshape(ola_len)
+        wola[:n_fft] += window_sum
+        out_len = t_new * hop_size
+        out = ola[:, :out_len] / (wola[:out_len] + 1e-10)
+        overlap_buffer = F.pad(ola[:, out_len:], (0, hop_size))
+        window_sum = F.pad(wola[out_len:], (0, hop_size))
+        return out
+
+    stft_cfg = dict(scnet_stream.stft_config)
+    stft_cfg['center'] = False
+    with torch.no_grad():
+        input_chunk = pad_mix_ext[..., 0:hop_size * 4]
+        stft_x = torch.stft(
+            torch.cat([cache_stft_0, input_chunk], dim=-1),
+            **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
+        )
+        x = torch.view_as_real(stft_x)
+        x = x.permute(0, 3, 1, 2).reshape(
+            x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
+        )
+        _, *state = scnet_stream.forward_1st_frame(x, *state)
+        cache_stft_0 = input_chunk[:, -3 * hop_size:]
+
+        n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+        for i in range(n_mid):
+            start = (i * 3 + 4) * hop_size
+            end = (i * 3 + 7) * hop_size
+            input_chunk = pad_mix_ext[..., start:end]
+            stft_x = torch.stft(
+                torch.cat([cache_stft_0, input_chunk], dim=-1),
+                **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
+            )
+            x = torch.view_as_real(stft_x)
+            x = x.permute(0, 3, 1, 2).reshape(
+                x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
+            )
+            cache_stft_0 = input_chunk
+            chunk_output, *state = scnet_stream(x, *state)
+            wave_chunks.append(push_ola_istft(chunk_output))
+
+        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        wave_chunks.append(push_ola_istft(chunk_output))
+        wave_chunks.append(
+            overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+        )
+
+    wave_ola = torch.cat(wave_chunks, dim=-1)
+    pad = n_fft // 2
+    wave_stream = wave_ola[:, pad:pad + L].reshape(wave_ref.shape)
+
+    # 裁回原始长度后对比
     wave_ref = wave_ref[..., :orig_len]
     wave_stream = wave_stream[..., :orig_len]
 
