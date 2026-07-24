@@ -2775,7 +2775,7 @@ def test_full_scnet():
 
     # ------------------------------------------------------------------
     # 流式：STFT + SCNetStreamNoSTFT(mid) + OLA ISTFT
-    # EOS 用 mid + 零谱冲 lookahead，不调用 forward_last_frame
+    # EOS：pad_mix_ext 多补 3hop 静音，for 多跑一轮 mid 冲 lookahead（无 last）
     # ------------------------------------------------------------------
     cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
     cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
@@ -2793,7 +2793,8 @@ def test_full_scnet():
              cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
              cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
 
-    pad_mix_ext = F.pad(pad_mix, (0, 2 * hop_size))
+    # +2hop: center=True 右端；+3hop: EOS 静音，多跑一次 mid 冲掉 lookahead（不用 last）
+    pad_mix_ext = F.pad(pad_mix, (0, 2 * hop_size + 3 * hop_size))
     L_ext = pad_mix_ext.shape[-1]
     cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
 
@@ -2864,13 +2865,6 @@ def test_full_scnet():
             chunk_output, *state = scnet_stream(x, *state)
             wave_chunks.append(push_ola_istft(chunk_output))
 
-        # EOS flush without forward_last_frame:
-        # feed one mid chunk of zero spectrogram (~3 frames / 3 hop silence)
-        # to drain lookahead. Same mid graph only (NPU first+mid); vs exact
-        # last_frame / offline expect ~1e-4 level error on the flushed tail.
-        x_eos = torch.zeros(1, 4, 2049, 3, dtype=torch.float32)
-        chunk_output, *state = scnet_stream(x_eos, *state)
-        wave_chunks.append(push_ola_istft(chunk_output))
         wave_chunks.append(
             overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
         )
