@@ -2921,9 +2921,17 @@ def test_onnx_inference():
         export_onnx,
     )
 
-    hop_size, n_fft, T = 1024, 4096, 16000
-    torch.manual_seed(42)
-    mix = torch.randn([2, T], dtype=torch.float32)
+    args = parse_args()
+    scnet = SCNet(args.instruments)
+    scnet = load_model(scnet, args.checkpoint_path)
+    scnet.eval()
+
+    audio_data, sample_rate = load_audio(args.input_dir)
+    mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
+    mix = convert_audio(mix, sample_rate, sample_rate, 2)
+    orig_len = mix.shape[-1]
+
+    hop_size, n_fft = 1024, 4096
 
     padding = hop_size - mix.shape[-1] % hop_size
     if (mix.shape[-1] + padding) // hop_size % 2 == 0:
@@ -2934,10 +2942,8 @@ def test_onnx_inference():
         padding += ((3 - t_frames % 3) % 3) * hop_size
     pad_mix = F.pad(mix, (0, padding))
     L = pad_mix.shape[-1]
-    orig_len = mix.shape[-1]
 
-    scnet = SCNet(sources=['accompaniment', 'vocals']).eval()
-    scnet_stream = SCNetStreamNoSTFT(sources=['accompaniment', 'vocals']).eval()
+    scnet_stream = SCNetStreamNoSTFT(sources=list(args.instruments))
     convert_state_dict(scnet, scnet_stream)
     scnet_stream.eval()
 
