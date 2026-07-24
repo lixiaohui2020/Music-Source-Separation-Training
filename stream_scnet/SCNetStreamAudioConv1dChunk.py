@@ -2774,7 +2774,8 @@ def test_full_scnet():
         wave_ref = scnet(pad_mix[None])
 
     # ------------------------------------------------------------------
-    # 流式：STFT + SCNetStreamNoSTFT + OLA ISTFT
+    # 流式：STFT + SCNetStreamNoSTFT(mid) + OLA ISTFT
+    # EOS 用 mid + 零谱冲 lookahead，不调用 forward_last_frame
     # ------------------------------------------------------------------
     cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
     cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
@@ -2863,7 +2864,12 @@ def test_full_scnet():
             chunk_output, *state = scnet_stream(x, *state)
             wave_chunks.append(push_ola_istft(chunk_output))
 
-        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        # EOS flush without forward_last_frame:
+        # feed one mid chunk of zero spectrogram (~3 frames / 3 hop silence)
+        # to drain lookahead. Same mid graph only (NPU first+mid); vs exact
+        # last_frame / offline expect ~1e-4 level error on the flushed tail.
+        x_eos = torch.zeros(1, 4, 2049, 3, dtype=torch.float32)
+        chunk_output, *state = scnet_stream(x_eos, *state)
         wave_chunks.append(push_ola_istft(chunk_output))
         wave_chunks.append(
             overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
@@ -2879,7 +2885,7 @@ def test_full_scnet():
 
     print(f"[test_full_scnet] non-stream={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
     diff_wave = (wave_stream - wave_ref).abs()
-    print(f"[test_full_scnet] stream vs non-stream: "
+    print(f"[test_full_scnet] stream(mid+zero EOS) vs non-stream: "
           f"max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
 
     separated_music_arrays = {}
