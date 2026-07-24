@@ -2901,8 +2901,216 @@ def test_full_scnet():
     save_sources(separated_stream_arrays, stream_sample_rates, stream_save_dir)
 
 
+def test_onnx_inference():
+    """
+    Export first/mid ONNX graphs and run the full streaming pipeline with ORT.
+
+    Host-side STFT + OLA ISTFT stay outside ONNX (same as test_full_scnet).
+    EOS flush uses +3 hop silence and mid only (no last graph).
+    """
+    import onnxruntime as ort
+    from onnx_common import (
+        CACHE_NAMES,
+        STATE_NAMES,
+        FIRST_INPUT_NAMES,
+        FIRST_OUTPUT_NAMES,
+        MID_INPUT_NAMES,
+        MID_OUTPUT_NAMES,
+        FirstONNXWrapper,
+        MidONNXWrapper,
+        export_onnx,
+    )
+
+    hop_size, n_fft, T = 1024, 4096, 16000
+    torch.manual_seed(42)
+    mix = torch.randn([2, T], dtype=torch.float32)
+
+    padding = hop_size - mix.shape[-1] % hop_size
+    if (mix.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    L = mix.shape[-1] + padding
+    t_frames = 1 + L // hop_size
+    if t_frames % 3 != 0:
+        padding += ((3 - t_frames % 3) % 3) * hop_size
+    pad_mix = F.pad(mix, (0, padding))
+    L = pad_mix.shape[-1]
+    orig_len = mix.shape[-1]
+
+    scnet = SCNet(sources=['accompaniment', 'vocals']).eval()
+    scnet_stream = SCNetStreamNoSTFT(sources=['accompaniment', 'vocals']).eval()
+    convert_state_dict(scnet, scnet_stream)
+    scnet_stream.eval()
+
+    with torch.no_grad():
+        wave_ref = scnet(pad_mix[None])
+
+    # ------------------------------------------------------------------
+    # Export first / mid ONNX (same wrappers as export_onnx_first/mid.py)
+    # ------------------------------------------------------------------
+    onnx_dir = Path(__file__).parent / "onnx"
+    first_path = onnx_dir / "scnet_first.onnx"
+    mid_path = onnx_dir / "scnet_mid.onnx"
+
+    z = lambda *shape: torch.zeros(*shape, dtype=torch.float32)
+    cache_in = (
+        z(1, 64, 616, 2), z(1, 128, 186, 2), z(1, 64, 57, 2),
+        z(1, 57, 64), z(1, 57, 64), z(1, 57, 128), z(1, 57, 128),
+        z(57, 128, 6),
+        z(1, 128, 57, 2), z(1, 256, 186, 2), z(1, 128, 616, 2),
+    )
+    example_spec = torch.randn(1, 4, 2049, 3)
+    example_state = (
+        *cache_in,
+        z(1, 64, 616, 3), z(1, 128, 186, 3), z(1, 64, 57, 3),
+    )
+
+    export_onnx(
+        FirstONNXWrapper(scnet_stream),
+        (example_spec, *cache_in),
+        first_path,
+        FIRST_INPUT_NAMES,
+        FIRST_OUTPUT_NAMES,
+    )
+    export_onnx(
+        MidONNXWrapper(scnet_stream),
+        (example_spec, *example_state),
+        mid_path,
+        MID_INPUT_NAMES,
+        MID_OUTPUT_NAMES,
+    )
+    print(f"Exported {first_path}")
+    print(f"Exported {mid_path}")
+
+    first_sess = ort.InferenceSession(str(first_path), providers=["CPUExecutionProvider"])
+    mid_sess = ort.InferenceSession(str(mid_path), providers=["CPUExecutionProvider"])
+
+    def make_zero_caches():
+        return [
+            torch.zeros(1, 64, 616, 2), torch.zeros(1, 128, 186, 2), torch.zeros(1, 64, 57, 2),
+            torch.zeros(1, 57, 64), torch.zeros(1, 57, 64),
+            torch.zeros(1, 57, 128), torch.zeros(1, 57, 128),
+            torch.zeros(57, 128, 6),
+            torch.zeros(1, 128, 57, 2), torch.zeros(1, 256, 186, 2), torch.zeros(1, 128, 616, 2),
+        ]
+
+    def wave_to_spec(x_wave):
+        x = x_wave.permute(0, 3, 1, 2).reshape(
+            x_wave.shape[0] // 2, x_wave.shape[3] * 2, x_wave.shape[1], x_wave.shape[2]
+        )
+        return x
+
+    def stft_chunk(input_chunk, cache_stft_0):
+        stft_x = torch.stft(
+            torch.cat([cache_stft_0, input_chunk], dim=-1),
+            **stft_cfg, window=win, return_complex=True,
+        )
+        x = torch.view_as_real(stft_x)
+        return wave_to_spec(x), input_chunk[:, -3 * hop_size:]
+
+    def run_stream(use_ort: bool):
+        state = make_zero_caches() + [None]
+        pad_mix_ext = F.pad(pad_mix, (0, 2 * hop_size + 3 * hop_size))
+        L_ext = pad_mix_ext.shape[-1]
+        cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
+        wave_chunks = []
+        overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
+        window_sum = torch.zeros([n_fft], dtype=torch.float32)
+        ort_state = None
+
+        def push_ola_istft(spec_rt):
+            nonlocal overlap_buffer, window_sum
+            if isinstance(spec_rt, np.ndarray):
+                spec_rt = torch.from_numpy(spec_rt)
+            n, _, t_new, _ = spec_rt.shape
+            if t_new == 0:
+                return torch.zeros(n, 0, dtype=torch.float32)
+            spec_c = torch.view_as_complex(spec_rt.permute(0, 2, 1, 3).contiguous())
+            frames = torch.fft.irfft(spec_c, n=n_fft, dim=-1).mul_(fft_scale)
+            frames.mul_(win)
+            ola_len = n_fft + (t_new - 1) * hop_size
+            frames_nct = frames.transpose(1, 2).contiguous()
+            ola = F.fold(
+                frames_nct, output_size=(1, ola_len),
+                kernel_size=(1, n_fft), stride=(1, hop_size),
+            ).reshape(n, ola_len)
+            ola[:, :n_fft] += overlap_buffer
+            w_frames = win_pow.view(1, n_fft, 1).expand(1, n_fft, t_new)
+            wola = F.fold(
+                w_frames, output_size=(1, ola_len),
+                kernel_size=(1, n_fft), stride=(1, hop_size),
+            ).reshape(ola_len)
+            wola[:n_fft] += window_sum
+            out_len = t_new * hop_size
+            out = ola[:, :out_len] / (wola[:out_len] + 1e-10)
+            overlap_buffer = F.pad(ola[:, out_len:], (0, hop_size))
+            window_sum = F.pad(wola[out_len:], (0, hop_size))
+            return out
+
+        with torch.no_grad():
+            x, cache_stft_0 = stft_chunk(pad_mix_ext[..., 0:hop_size * 4], cache_stft_0)
+            if use_ort:
+                feeds = {FIRST_INPUT_NAMES[0]: x.numpy()}
+                for name, tensor in zip(CACHE_NAMES, state[:11]):
+                    feeds[name] = tensor.numpy()
+                ort_state = first_sess.run(None, feeds)
+            else:
+                _, *state = scnet_stream.forward_1st_frame(x, *state)
+
+            n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+            for i in range(n_mid):
+                start = (i * 3 + 4) * hop_size
+                end = (i * 3 + 7) * hop_size
+                x, cache_stft_0 = stft_chunk(pad_mix_ext[..., start:end], cache_stft_0)
+                if use_ort:
+                    feeds = {MID_INPUT_NAMES[0]: x.numpy()}
+                    for name, val in zip(STATE_NAMES, ort_state):
+                        feeds[name] = val
+                    ort_out = mid_sess.run(None, feeds)
+                    chunk_output = ort_out[0]
+                    ort_state = ort_out[1:]
+                else:
+                    chunk_output, *state = scnet_stream(x, *state)
+                wave_chunks.append(push_ola_istft(chunk_output))
+
+            wave_chunks.append(
+                overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+            )
+
+        wave_ola = torch.cat(wave_chunks, dim=-1)
+        pad = n_fft // 2
+        return wave_ola[:, pad:pad + L].reshape(wave_ref.shape)
+
+    stft_cfg = dict(scnet_stream.stft_config)
+    stft_cfg['center'] = False
+    n_ola = len(scnet_stream.sources) * scnet_stream.audio_channels
+    win = scnet_stream.stft_window
+    win_pow = win * win
+    fft_scale = n_fft ** 0.5
+
+    wave_torch = run_stream(use_ort=False)
+    wave_ort = run_stream(use_ort=True)
+
+    wave_ref = wave_ref[..., :orig_len]
+    wave_torch = wave_torch[..., :orig_len]
+    wave_ort = wave_ort[..., :orig_len]
+
+    diff_torch = (wave_torch - wave_ref).abs()
+    diff_ort = (wave_ort - wave_ref).abs()
+    diff_ort_torch = (wave_ort - wave_torch).abs()
+
+    print(f"[test_onnx_inference] ref={tuple(wave_ref.shape)}, "
+          f"torch={tuple(wave_torch.shape)}, ort={tuple(wave_ort.shape)}")
+    print(f"[test_onnx_inference] torch vs ref: max={diff_torch.max().item():.6e}, "
+          f"mean={diff_torch.mean().item():.6e}")
+    print(f"[test_onnx_inference] ort  vs ref: max={diff_ort.max().item():.6e}, "
+          f"mean={diff_ort.mean().item():.6e}")
+    print(f"[test_onnx_inference] ort  vs torch: max={diff_ort_torch.max().item():.6e}, "
+          f"mean={diff_ort_torch.mean().item():.6e}")
+
+
 if __name__ == '__main__':
     test_full_scnet()
+    # test_onnx_inference()
     # test_scnet()
     # test_scnet_noistft()
     # test_scnet_stft_stream()
