@@ -1,0 +1,3305 @@
+import os.path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import deque
+
+from separationStreamConv1dAudioChunk import SeparationNetStream, SeparationNet
+import typing as tp
+import math
+import onnx
+import onnxsim
+import numpy as np
+# import parser  # removed in Python 3.10+; unused
+import argparse
+import soundfile as sf
+from pathlib import Path
+from scnet.utils import convert_audio
+
+# model
+def load_model(model, checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError("No model checkpoint file found at " + str(checkpoint_path))
+
+    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+
+    if 'best_state' not in checkpoint:
+        raise KeyError("Checkpoint does not contain the state")
+
+    state_dict = checkpoint['best_state']
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            new_state_dict[k[7:]] = v
+        else:
+            new_state_dict[k] = v
+
+    model.load_state_dict(new_state_dict)
+    return model
+
+def load_audio(file_path):
+    try:
+        data, sample_rate = sf.read(file_path, dtype='float32')
+        return data, sample_rate
+    except Exception as e:
+        print(f"Error loading audio file {file_path}: {e}")
+        raise
+
+
+def save_sources(sources, output_sample_rates, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    for name, src in sources.items():
+        save_path = os.path.join(save_dir, f'{name}.wav')
+        sf.write(save_path, src, output_sample_rates[name])
+        print(f"Saved {name} to {save_path}")
+
+class Swish(nn.Module):
+    def forward(self, x):
+        return x * x.sigmoid()
+
+
+class ConvolutionModule(nn.Module):
+    """
+    Convolution Module in SD block.
+
+    Args:
+        channels (int): input/output channels.
+        depth (int): number of layers in the residual branch. Each layer has its own
+        compress (float): amount of channel compression.
+        kernel (int): kernel size for the convolutions.
+        """
+
+    def __init__(self, channels, depth=2, compress=4, kernel=3):
+        super().__init__()
+        assert kernel % 2 == 1
+        self.depth = abs(depth)
+        hidden_size = int(channels / compress)
+        # norm = lambda d: nn.GroupNorm(1, d)
+        norm = lambda d: nn.BatchNorm2d(d)
+        self.layers = nn.ModuleList([])
+        # for _ in range(self.depth):
+        #     padding = (kernel // 2)
+        #     mods = [
+        #         norm(channels),
+        #         nn.Conv1d(channels, hidden_size*2, kernel, padding = padding),
+        #         nn.GLU(1),
+        #         nn.Conv1d(hidden_size, hidden_size, kernel, padding = padding, groups = hidden_size),
+        #         norm(hidden_size),
+        #         Swish(),
+        #         nn.Conv1d(hidden_size, channels, 1),
+        #     ]
+        #     layer = nn.Sequential(*mods)
+        #     self.layers.append(layer)
+        for _ in range(self.depth):
+            padding = (kernel // 2)
+            mods = [
+                nn.Conv2d(channels, hidden_size * 2, (kernel, 1), padding=(padding, 0)),
+                norm(hidden_size * 2),
+                nn.GLU(1),
+                nn.Conv2d(hidden_size, hidden_size, (kernel, 1), padding=(padding, 0), groups=hidden_size),
+                norm(hidden_size),
+                Swish(),
+                nn.Conv2d(hidden_size, channels, (1, 1)),
+            ]
+            layer = nn.Sequential(*mods)
+            self.layers.append(layer)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = x + layer(x)
+        return x
+
+
+class FusionLayer(nn.Module):
+    """
+    A FusionLayer within the decoder.
+
+    Args:
+    - channels (int): Number of input channels.
+    - kernel_size (int, optional): Kernel size for the convolutional layer, defaults to 3.
+    - stride (int, optional): Stride for the convolutional layer, defaults to 1.
+    - padding (int, optional): Padding for the convolutional layer, defaults to 1.
+    """
+
+    def __init__(self, channels, kernel_size=3, stride=1, padding=1):
+        super(FusionLayer, self).__init__()
+        lookahead = 0
+        kernel_size = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        )
+        stride = (
+            (stride, stride) if isinstance(stride, int) else tuple(stride)
+        )
+
+        fpad = kernel_size[1] // 2
+        pad = (kernel_size[1] - 1 - lookahead, lookahead, 0, 0)
+        self.pad = nn.ConstantPad2d(pad, 0.0)
+        self.conv = nn.Conv2d(channels * 2, channels * 2, kernel_size, stride=stride, padding=(fpad, 0))
+
+    def forward(self, x, skip=None):
+        if skip is not None:
+            x += skip
+        x = x.repeat(1, 2, 1, 1)
+        x = self.pad(x)
+        x = self.conv(x)
+        x = F.glu(x, dim=1)
+        return x
+
+
+class FusionLayerStream(nn.Module):
+    """
+    A FusionLayer within the decoder.
+
+    Args:
+    - channels (int): Number of input channels.
+    - kernel_size (int, optional): Kernel size for the convolutional layer, defaults to 3.
+    - stride (int, optional): Stride for the convolutional layer, defaults to 1.
+    - padding (int, optional): Padding for the convolutional layer, defaults to 1.
+    """
+
+    def __init__(self, channels, kernel_size=3, stride=1, padding=1):
+        super(FusionLayerStream, self).__init__()
+        lookahead = 0
+        kernel_size = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        )
+        stride = (
+            (stride, stride) if isinstance(stride, int) else tuple(stride)
+        )
+
+        fpad = kernel_size[1] // 2
+        pad = (kernel_size[1] - 1 - lookahead, lookahead, 0, 0)
+        self.pad = nn.ConstantPad2d(pad, 0.0)
+        self.conv = nn.Conv2d(channels * 2, channels * 2, kernel_size, stride=stride, padding=(fpad, 0))
+
+    def forward(self, x, cache_in, skip=None):
+        if skip is not None:
+            x += skip
+        x = x.repeat(1, 2, 1, 1)
+        x = torch.cat([cache_in, x], dim=-1)
+        cache_out = x[..., -2:]
+        x = self.conv(x)
+        x = F.glu(x, dim=1)
+        return x, cache_out
+
+
+class SDlayer(nn.Module):
+    """
+    Implements a Sparse Down-sample Layer for processing different frequency bands separately.
+
+    Args:
+    - channels_in (int): Input channel count.
+    - channels_out (int): Output channel count.
+    - band_configs (dict): A dictionary containing configuration for each frequency band.
+                           Keys are 'low', 'mid', 'high' for each band, and values are
+                           dictionaries with keys 'SR', 'stride', and 'kernel' for proportion,
+                           stride, and kernel size, respectively.
+    """
+
+    def __init__(self, channels_in, channels_out, band_configs):
+        super(SDlayer, self).__init__()
+
+        # Initializing convolutional layers for each band
+        self.convs = nn.ModuleList()
+        self.strides = []
+        self.kernels = []
+        for config in band_configs.values():
+            self.convs.append(
+                nn.Conv2d(channels_in, channels_out, (config['kernel'], 1), (config['stride'], 1), (0, 0)))
+            self.strides.append(config['stride'])
+            self.kernels.append(config['kernel'])
+
+        # Saving rate proportions for determining splits
+        self.SR_low = band_configs['low']['SR']
+        self.SR_mid = band_configs['mid']['SR']
+
+    def forward(self, x):
+        B, C, Fr, T = x.shape
+        # Define splitting points based on sampling rates
+        splits = [
+            (0, math.ceil(Fr * self.SR_low)),
+            (math.ceil(Fr * self.SR_low), math.ceil(Fr * (self.SR_low + self.SR_mid))),
+            (math.ceil(Fr * (self.SR_low + self.SR_mid)), Fr)
+        ]
+
+        # Processing each band with the corresponding convolution
+        outputs = []
+        original_lengths = []
+        for conv, stride, kernel, (start, end) in zip(self.convs, self.strides, self.kernels, splits):
+            extracted = x[:, :, start:end, :]
+            original_lengths.append(end - start)
+            current_length = extracted.shape[2]
+
+            # padding
+            if stride == 1:
+                total_padding = kernel - stride
+            else:
+                total_padding = (stride - current_length % stride) % stride
+            pad_left = total_padding // 2
+            pad_right = total_padding - pad_left
+
+            padded = F.pad(extracted, (0, 0, pad_left, pad_right))
+
+            output = conv(padded)
+            outputs.append(output)
+
+        return outputs, original_lengths
+
+
+class SUlayer(nn.Module):
+    """
+    Implements a Sparse Up-sample Layer in decoder.
+
+    Args:
+    - channels_in: The number of input channels.
+    - channels_out: The number of output channels.
+    - convtr_configs: Dictionary containing the configurations for transposed convolutions.
+    """
+
+    def __init__(self, channels_in, channels_out, band_configs):
+        super(SUlayer, self).__init__()
+
+        # Initializing convolutional layers for each band
+        self.convtrs = nn.ModuleList([
+            nn.ConvTranspose2d(channels_in, channels_out, [config['kernel'], 1], [config['stride'], 1])
+            for _, config in band_configs.items()
+        ])
+
+    def forward(self, x, lengths, origin_lengths):
+        B, C, Fr, T = x.shape
+        # Define splitting points based on input lengths
+        splits = [
+            (0, lengths[0]),
+            (lengths[0], lengths[0] + lengths[1]),
+            (lengths[0] + lengths[1], None)
+        ]
+        # Processing each band with the corresponding convolution
+        outputs = []
+        for idx, (convtr, (start, end)) in enumerate(zip(self.convtrs, splits)):
+            out = convtr(x[:, :, start:end, :])
+            # Calculate the distance to trim the output symmetrically to original length
+            current_Fr_length = out.shape[2]
+            dist = abs(origin_lengths[idx] - current_Fr_length) // 2
+
+            # Trim the output to the original length symmetrically
+            trimmed_out = out[:, :, dist:dist + origin_lengths[idx], :]
+
+            outputs.append(trimmed_out)
+
+        # Concatenate trimmed outputs along the frequency dimension to return the final tensor
+        x = torch.cat(outputs, dim=2)
+
+        return x
+
+
+class SDblock(nn.Module):
+    """
+    Implements a simplified Sparse Down-sample block in encoder.
+
+    Args:
+    - channels_in (int): Number of input channels.
+    - channels_out (int): Number of output channels.
+    - band_config (dict): Configuration for the SDlayer specifying band splits and convolutions.
+    - conv_config (dict): Configuration for convolution modules applied to each band.
+    - depths (list of int): List specifying the convolution depths for low, mid, and high frequency bands.
+    """
+
+    def __init__(self, channels_in, channels_out, band_configs={}, conv_config={}, depths=[3, 2, 1], kernel_size=3):
+        super(SDblock, self).__init__()
+        self.SDlayer = SDlayer(channels_in, channels_out, band_configs)
+
+        # Dynamically create convolution modules for each band based on depths
+        self.conv_modules = nn.ModuleList([
+            ConvolutionModule(channels_out, depth, **conv_config) for depth in depths
+        ])
+        # Set the kernel_size to an odd number.
+        lookahead = 0
+        kernel_size = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        )
+
+        fpad = kernel_size[0] // 2
+        pad = (kernel_size[1] - 1 - lookahead, lookahead, 0, 0)
+        self.pad = nn.ConstantPad2d(pad, 0.0)
+        self.globalconv = nn.Conv2d(channels_out, channels_out, kernel_size, (1, 1), (fpad, 0))
+
+    def forward(self, x):
+        bands, original_lengths = self.SDlayer(x)
+        # B, C, f, T = band.shape
+        # reshape(-1, band.shape[1], band.shape[3]) --> reshape(-1, band.shape[1], band.shape[2])
+        # bands = [
+        #     F.gelu(
+        #         conv(band.permute(0, 2, 1, 3).reshape(-1, band.shape[1], band.shape[2]))
+        #         .view(band.shape[0], band.shape[2], band.shape[1], band.shape[3])
+        #         .permute(0, 2, 1, 3)
+        #     )
+        #     for conv, band in zip(self.conv_modules, bands)
+        #
+        # ]
+        conv_bands = []
+        for conv, band in zip(self.conv_modules, bands):
+            conv_bands.append(F.gelu(conv(band)))
+        # bands = [
+        #     F.gelu(conv(band))
+        #     for conv, band in zip(self.conv_modules, bands)
+        # ]
+        # for conv, band in zip(self.conv_modules, bands):
+        #     conv_out = F.gelu(conv(band))
+        #     bands.append(conv_out)
+
+        lengths = [band.size(-2) for band in conv_bands]
+        full_band = torch.cat(conv_bands, dim=2)
+        skip = full_band
+
+        full_band = self.pad(full_band)
+        output = self.globalconv(full_band)
+
+        return output, skip, lengths, original_lengths
+
+
+class SDblockStream(nn.Module):
+    """
+    Implements a simplified Sparse Down-sample block in encoder.
+
+    Args:
+    - channels_in (int): Number of input channels.
+    - channels_out (int): Number of output channels.
+    - band_config (dict): Configuration for the SDlayer specifying band splits and convolutions.
+    - conv_config (dict): Configuration for convolution modules applied to each band.
+    - depths (list of int): List specifying the convolution depths for low, mid, and high frequency bands.
+    """
+
+    def __init__(self, channels_in, channels_out, band_configs={}, conv_config={}, depths=[3, 2, 1], kernel_size=3):
+        super(SDblockStream, self).__init__()
+        self.SDlayer = SDlayer(channels_in, channels_out, band_configs)
+
+        # Dynamically create convolution modules for each band based on depths
+        self.conv_modules = nn.ModuleList([
+            ConvolutionModule(channels_out, depth, **conv_config) for depth in depths
+        ])
+        # Set the kernel_size to an odd number.
+        lookahead = 0
+        kernel_size = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        )
+
+        fpad = kernel_size[0] // 2
+        pad = (kernel_size[1] - 1 - lookahead, lookahead, 0, 0)
+        self.pad = nn.ConstantPad2d(pad, 0.0)
+        self.globalconv = nn.Conv2d(channels_out, channels_out, kernel_size, (1, 1), (fpad, 0))
+
+    def forward(self, x, band_input):
+        bands, original_lengths = self.SDlayer(x)
+        # B, C, f, T = band.shape
+        # reshape(-1, band.shape[1], band.shape[3]) --> reshape(-1, band.shape[1], band.shape[2])
+        # bands = [
+        #     F.gelu(
+        #         conv(band.permute(0, 2, 1, 3).reshape(-1, band.shape[1], band.shape[2]))
+        #         .view(band.shape[0], band.shape[2], band.shape[1], band.shape[3])
+        #         .permute(0, 2, 1, 3)
+        #     )
+        #     for conv, band in zip(self.conv_modules, bands)
+        #
+        # ]
+        conv_bands = []
+        for conv, band in zip(self.conv_modules, bands):
+            conv_bands.append(F.gelu(conv(band)))
+        # bands=[
+        #     F.gelu(conv(band))
+        #     for conv, band in zip(self.conv_modules, bands)
+        # ]
+        # for conv, band in zip(self.conv_modules, bands):
+        #     conv_out = F.gelu(conv(band))
+        #     bands.append(conv_out)
+
+        lengths = [band.size(-2) for band in conv_bands]
+        full_band = torch.cat(conv_bands, dim=2)
+        skip = full_band
+
+        tmp_input = torch.cat([band_input, full_band], dim=-1)
+
+        output = self.globalconv(tmp_input)
+
+        return output, skip, lengths, original_lengths, tmp_input[..., -2:]
+
+
+class SCNet(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 64],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=2,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_out_window", torch.hann_window(nfft), persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblock(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayer(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        self.separation_net = SeparationNet(
+            channels=dims[-1],
+            expand=expand,
+            num_layers=num_dplayer,
+        )
+
+    def forward(self, x):
+        # B, C, L = x.shape
+        B = x.shape[0]
+
+        # STFT (caller must pad x to an even STFT frame count before forward)
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # # encoder
+        for sd_layer in self.encoder:
+            x, skip, lengths, original_lengths = sd_layer(x)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = self.separation_net(x)
+        #
+        # # decoder
+        for fusion_layer, su_layer in self.decoder:
+            x = fusion_layer(x, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        x = torch.view_as_complex(x.contiguous())
+        # x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device).to(torch.float16))
+
+        x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device))
+        x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        return x
+
+    def forward_stft(self, x):
+        # B, C, L = x.shape
+
+        # STFT
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+        return x
+
+class SCNetNoISTFT(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 64],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=2,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_out_window", torch.hann_window(nfft), persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblock(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayer(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        self.separation_net = SeparationNet(
+            channels=dims[-1],
+            expand=expand,
+            num_layers=num_dplayer,
+        )
+
+    def forward(self, x):
+        # B, C, L = x.shape
+
+        # STFT
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        # # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        # # # std = x.std(dim=(1, 2, 3), keepdim=True)
+        # # # x = (x - mean) / (1e-5 + std)
+        # #
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # # encoder
+        for sd_layer in self.encoder:
+            x, skip, lengths, original_lengths = sd_layer(x)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = self.separation_net(x)
+        #
+        # # decoder
+        for fusion_layer, su_layer in self.decoder:
+            x = fusion_layer(x, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        # x = torch.view_as_complex(x.contiguous())
+        # # x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device).to(torch.float16))
+        #
+        # x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device))
+        # x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        return x
+
+    def forward_stft(self, x):
+        # B, C, L = x.shape
+
+        # STFT
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+        return x
+
+class SCNetNoStft(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 64],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=2,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_out_window", torch.hann_window(nfft), persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblock(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayer(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        self.separation_net = SeparationNet(
+            channels=dims[-1],
+            expand=expand,
+            num_layers=num_dplayer,
+        )
+
+    def forward(self, x):
+        # B, C, L = x.shape
+
+
+        # STFT
+        # L = x.shape[-1]
+        # x = x.reshape(-1, L)
+        # x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        # x = torch.view_as_real(x)
+        # x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+        #                                   x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        # # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        # # # std = x.std(dim=(1, 2, 3), keepdim=True)
+        # # # x = (x - mean) / (1e-5 + std)
+        # #
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # # encoder
+        for sd_layer in self.encoder:
+            x, skip, lengths, original_lengths = sd_layer(x)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = self.separation_net(x)
+        #
+        # # decoder
+        for fusion_layer, su_layer in self.decoder:
+            x = fusion_layer(x, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        # x = torch.view_as_complex(x.contiguous())
+        # x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device).to(torch.float16))
+
+        # x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device))
+        # x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+
+        return x
+
+class SCNetBandPartialChannel2(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 128],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=6,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_out_window", torch.hann_window(nfft), persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        # self.stft_config = {
+        #     'n_fft': nfft,
+        #     'hop_length': hop_size,
+        #     'win_length': win_size,
+        #     'center': False,
+        #     'normalized': True
+        # }
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblock(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayer(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        # self.separation_net = SeparationNet(
+        #     channels=dims[-1],
+        #     expand=expand,
+        #     num_layers=num_dplayer,
+        # )
+        self.separation_net = SeparationNet(128, 64, 64)
+
+    def forward(self, x):
+        # B, C, L = x.shape
+        # B = x.shape[0]
+        # In the initial padding, ensure that the number of frames after the STFT (the length of the T dimension) is even,
+        # so that the RFFT operation can be used in the separation network.
+        # padding = self.hop_length - x.shape[-1] % self.hop_length
+        # if (x.shape[-1] + padding) // self.hop_length % 2 == 0:
+        #     padding += self.hop_length
+        # x = F.pad(x, (0, padding))
+
+        # STFT
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        # # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        # # # std = x.std(dim=(1, 2, 3), keepdim=True)
+        # # # x = (x - mean) / (1e-5 + std)
+        # #
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # # encoder
+        for sd_layer in self.encoder:
+            x, skip, lengths, original_lengths = sd_layer(x)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = x.transpose(2, 3)
+        x = self.separation_net(x)
+        x = x.transpose(2, 3)
+        #
+        # # decoder
+        for fusion_layer, su_layer in self.decoder:
+            x = fusion_layer(x, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        x = torch.view_as_complex(x.contiguous())
+        # x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device).to(torch.float16))
+
+        x = torch.istft(x, **self.stft_config, window=self.stft_out_window.to(x.device))
+        x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+
+        # x = x[:, :, :, :-padding]
+
+        return x
+
+class SCNetStream(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 64],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=2,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        # stft parameter
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_window_power", self.stft_window ** 2, persistent=False)
+        rfft_real, rfft_imag = self.create_rfft_matrix(nfft)
+        scale = 1.0 / math.sqrt(nfft)
+        self.scale = scale
+        self.register_buffer("rfft_real", rfft_real.T * scale, persistent=False)
+        self.register_buffer("rfft_imag", rfft_imag.T * scale, persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        irfft_real, irfft_imag = self.create_irfft_matrix(nfft)
+        self.register_buffer("irfft_real", irfft_real.T * scale, persistent=False)
+        self.register_buffer("irfft_imag", irfft_imag.T * scale, persistent=False)
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblockStream(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayerStream(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        self.separation_net = SeparationNetStream(
+            channels=dims[-1],
+            expand=expand,
+            num_layers=num_dplayer,
+        )
+
+    def create_rfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = int(n_fft / 2) + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(1)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(0)
+
+        angle = -2.0 * math.pi * k * n / n_fft
+
+        rfft_real = torch.cos(angle).to(dtype)
+        rfft_imag = torch.sin(angle).to(dtype)
+
+        return rfft_real, rfft_imag
+
+    def create_irfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = n_fft // 2 + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(0)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(1)
+
+        angle = 2.0 * math.pi * k * n / n_fft
+
+        irfft_real = torch.cos(angle).to(dtype)
+        irfft_imag = torch.sin(angle).to(dtype)
+
+        scale = torch.ones(freq_size, dtype=dtype)
+        scale[1:-1] = 2.0
+        irfft_real = irfft_real * scale.unsqueeze(0)
+        irfft_imag = irfft_imag * scale.unsqueeze(0)
+
+        return irfft_real, irfft_imag
+
+    def forward(self, x, cache_stft_in, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_h1, cache_c1, cache_h2, cache_c2, cache_conv, lookahead,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, overlap_buffer_in, window_sum_in):
+        # B, C, L = x.shape
+        # B = x.shape[0]
+        # In the initial padding, ensure that the number of frames after the STFT (the length of the T dimension) is even,
+        # so that the RFFT operation can be used in the separation network.
+        # padding = self.hop_length - x.shape[-1] % self.hop_length
+        # if (x.shape[-1] + padding) // self.hop_length % 2 == 0:
+        #     padding += self.hop_length
+        # x = F.pad(x, (0, padding))
+
+        # STFT
+        x = torch.cat([cache_stft_in, x], dim=-1)
+        cache_stft_out = x[:, self.hop_length:]
+        frames_windowed = x * self.stft_window
+        real_part = torch.matmul(frames_windowed, self.rfft_real)
+        imag_part = torch.matmul(frames_windowed, self.rfft_imag)
+
+        x = torch.cat([real_part.unsqueeze(-1), imag_part.unsqueeze(-1)], dim=-1)
+        x = x.unsqueeze(-2)
+        # x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x, new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv, lookahead = self.separation_net(x, cache_h1, cache_c1, cache_h2, cache_c2, cache_conv, lookahead)
+        if x is None:
+            return (None, cache_stft_out, cache_band0_out, cache_band1_out, cache_band2_out,
+                    new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv, lookahead,
+                    cache_fus0_in, cache_fus1_in, cache_fus2_in, overlap_buffer_in, window_sum_in)
+        #
+        # decoder
+        icnt = 0
+        for fusion_layer, su_layer in self.decoder:
+            if icnt == 0:
+                x, cache_fus0_out = fusion_layer(x, cache_fus0_in, save_skip.pop())
+            elif icnt == 1:
+                x, cache_fus1_out = fusion_layer(x, cache_fus1_in, save_skip.pop())
+            elif icnt == 2:
+                x, cache_fus2_out = fusion_layer(x, cache_fus2_in, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+            icnt = icnt + 1
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        x = x.squeeze(2)
+        time_frame = torch.matmul(x[..., 0], self.irfft_real) - torch.matmul(x[..., 1], self.irfft_imag)
+        window_frame = time_frame * self.stft_window
+        overlap_buffer_out = overlap_buffer_in + window_frame
+        window_sum_out = window_sum_in + self.stft_window_power
+        window_norm = window_sum_out[..., :self.hop_length]
+        # window_norm = torch.where(window_norm > 1e-8, window_norm, torch.ones_like(window_norm))
+        output = overlap_buffer_out[..., :self.hop_length].clone()
+        x = output / (window_norm + 1e-10)
+        overlap_buffer_out = torch.cat([overlap_buffer_out[..., self.hop_length:],
+                                        torch.zeros([overlap_buffer_in.shape[0], self.hop_length])], dim=-1)
+        window_sum_out = torch.cat([window_sum_out[..., self.hop_length:],
+                                    torch.zeros([window_sum_in.shape[0], self.hop_length])], dim=-1)
+        x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        # cache_stft_out = cache_stft_in
+        # overlap_buffer_out, window_sum_out = overlap_buffer_in, window_sum_in
+        # x = x[:, :, :, :-padding]
+        return (x, cache_stft_out, cache_band0_out, cache_band1_out, cache_band2_out,
+                new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv, lookahead,
+                cache_fus0_out, cache_fus1_out, cache_fus2_out,
+                overlap_buffer_out, window_sum_out)
+
+    def forward_stft_istft(self, x, cache_stft_in, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, overlap_buffer_in, window_sum_in):
+        # B, C, L = x.shape
+
+        # STFT
+        x_nstft = torch.cat([cache_stft_in, x], dim=-1)
+        cache_stft_out = x_nstft[:, self.hop_length:]
+        frames_windowed_nstft = x_nstft * self.stft_window
+        real_part_nstft = torch.matmul(frames_windowed_nstft, self.rfft_real)
+        imag_part_nstft = torch.matmul(frames_windowed_nstft, self.rfft_imag)
+        x_nstft = torch.cat([real_part_nstft.unsqueeze(-1), imag_part_nstft.unsqueeze(-1)], dim=-1)
+        x_nstft = x_nstft.unsqueeze(-2)
+        # x = torch.view_as_real(x)
+
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        # x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        x = torch.view_as_real(x)
+
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        # # std = x.std(dim=(1, 2, 3), keepdim=True)
+        # # x = (x - mean) / (1e-5 + std)
+        #
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = self.separation_net(x)
+        #
+        # decoder
+        icnt = 0
+        for fusion_layer, su_layer in self.decoder:
+            if icnt == 0:
+                x, cache_fus0_out = fusion_layer(x, cache_fus0_in, save_skip.pop())
+            elif icnt == 1:
+                x, cache_fus1_out = fusion_layer(x, cache_fus1_in, save_skip.pop())
+            elif icnt == 2:
+                x, cache_fus2_out = fusion_layer(x, cache_fus2_in, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+            icnt = icnt + 1
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        x = x.squeeze(2)
+        time_frame = torch.matmul(x[..., 0], self.irfft_real) - torch.matmul(x[..., 1], self.irfft_imag)
+        window_frame = time_frame * self.stft_window
+        overlap_buffer_out = overlap_buffer_in + window_frame
+        window_sum_out = window_sum_in + self.stft_window_power
+        window_norm = window_sum_out[..., :self.hop_length]
+        # window_norm = torch.where(window_norm > 1e-8, window_norm, torch.ones_like(window_norm))
+        output = overlap_buffer_out[..., :self.hop_length].clone()
+        x = output / (window_norm + 1e-10)
+        # x = output / window_norm
+        overlap_buffer_out = torch.cat([overlap_buffer_out[..., self.hop_length:],
+                                        torch.zeros([overlap_buffer_in.shape[0], self.hop_length])], dim=-1)
+        window_sum_out = torch.cat([window_sum_out[..., self.hop_length:],
+                                    torch.zeros([window_sum_in.shape[0], self.hop_length])], dim=-1)
+        x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        # cache_stft_out = cache_stft_in
+        # overlap_buffer_out, window_sum_out = overlap_buffer_in, window_sum_in
+        # x = x[:, :, :, :-padding]
+        return (x, cache_stft_out, cache_band0_out, cache_band1_out, cache_band2_out,
+                cache_fus0_out, cache_fus1_out, cache_fus2_out, overlap_buffer_out, window_sum_out)
+
+    def forward_stft(self, x, x_chunk, cache_stft_in):
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        stft_x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        real_stft_x = torch.view_as_real(stft_x)
+        output_non_stream = real_stft_x.permute(0, 3, 1, 2).reshape(real_stft_x.shape[0] // self.audio_channels, real_stft_x.shape[3] * self.audio_channels,
+                                          real_stft_x.shape[1], real_stft_x.shape[2])
+
+        x_nstft = torch.cat([cache_stft_in, x_chunk], dim=-1)
+        cache_stft_out = x_nstft[:, self.hop_length:]
+        frames_windowed_nstft = x_nstft * self.stft_window
+        real_part_nstft = torch.matmul(frames_windowed_nstft, self.rfft_real)
+        real_out = torch.matmul(x_nstft, self.stft_window[:, None]*self.rfft_real)
+
+        imag_part_nstft = torch.matmul(frames_windowed_nstft, self.rfft_imag)
+        x_nstft = torch.cat([real_part_nstft.unsqueeze(-1), imag_part_nstft.unsqueeze(-1)], dim=-1)
+        x_nstft = x_nstft.unsqueeze(-2)
+
+        return output_non_stream, x_nstft, cache_stft_out
+
+class SCNetStreamNoISTFT(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 64],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=2,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        # stft parameter
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_window_power", self.stft_window ** 2, persistent=False)
+        rfft_real, rfft_imag = self.create_rfft_matrix(nfft)
+        scale = 1.0 / math.sqrt(nfft)
+        self.scale = scale
+        self.register_buffer("rfft_real", rfft_real.T * scale, persistent=False)
+        self.register_buffer("rfft_imag", rfft_imag.T * scale, persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        irfft_real, irfft_imag = self.create_irfft_matrix(nfft)
+        self.register_buffer("irfft_real", irfft_real.T * scale, persistent=False)
+        self.register_buffer("irfft_imag", irfft_imag.T * scale, persistent=False)
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblockStream(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayerStream(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        self.separation_net = SeparationNetStream(
+            channels=dims[-1],
+            expand=expand,
+            num_layers=num_dplayer,
+        )
+
+    def create_rfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = int(n_fft / 2) + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(1)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(0)
+
+        angle = -2.0 * math.pi * k * n / n_fft
+
+        rfft_real = torch.cos(angle).to(dtype)
+        rfft_imag = torch.sin(angle).to(dtype)
+
+        return rfft_real, rfft_imag
+
+    def create_irfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = n_fft // 2 + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(0)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(1)
+
+        angle = 2.0 * math.pi * k * n / n_fft
+
+        irfft_real = torch.cos(angle).to(dtype)
+        irfft_imag = torch.sin(angle).to(dtype)
+
+        scale = torch.ones(freq_size, dtype=dtype)
+        scale[1:-1] = 2.0
+        irfft_real = irfft_real * scale.unsqueeze(0)
+        irfft_imag = irfft_imag * scale.unsqueeze(0)
+
+        return irfft_real, irfft_imag
+
+    def forward_1st_frame(self, x, cache_stft, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, save_skip_in):
+        C = x.shape
+        full_input = torch.cat([cache_stft, x], dim=-1)
+        cache_stft_out = full_input[:, -3*self.hop_length:]
+        frame = F.unfold(full_input.view(C, 1, 1, -1),
+                         [1, self.win_length],
+                         stride=(1, self.hop_length))
+        frame = frame.permute(2, 0, 1)
+        frame_win = frame * self.stft_window
+        real_part = torch.matmul(frame_win, self.rfft_real)
+        imag_part = torch.matmul(frame_win, self.rfft_imag)
+
+        x = torch.cat([real_part.unsqueeze(-1), imag_part.unsqueeze(-1)], dim=-1)
+        x = x.unsqueeze(-2)
+        # x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        (x, new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2,
+         new_cache_conv) = self.separation_net.forward_1st_frame(x, cache_h1, cache_c1, cache_h2, cache_c2, cache_conv)
+
+        return (None, cache_stft_out, cache_band0_out, cache_band1_out, cache_band2_out,
+                new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, save_skip)
+
+    def forward(self, x, cache_stft_in, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_h1, cache_c1, cache_h2, cache_c2, cache_conv, lookahead,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, overlap_buffer_in, window_sum_in):
+        # STFT
+        x = torch.cat([cache_stft_in, x], dim=-1)
+        cache_stft_out = x[:, self.hop_length:]
+        frames_windowed = x * self.stft_window
+        real_part = torch.matmul(frames_windowed, self.rfft_real)
+        imag_part = torch.matmul(frames_windowed, self.rfft_imag)
+
+        x = torch.cat([real_part.unsqueeze(-1), imag_part.unsqueeze(-1)], dim=-1)
+        x = x.unsqueeze(-2)
+        # x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x, new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv, lookahead = self.separation_net(x, cache_h1, cache_c1, cache_h2, cache_c2, cache_conv, lookahead)
+        #
+        # decoder
+        icnt = 0
+        for fusion_layer, su_layer in self.decoder:
+            if icnt == 0:
+                x, cache_fus0_out = fusion_layer(x, cache_fus0_in, save_skip.pop())
+            elif icnt == 1:
+                x, cache_fus1_out = fusion_layer(x, cache_fus1_in, save_skip.pop())
+            elif icnt == 2:
+                x, cache_fus2_out = fusion_layer(x, cache_fus2_in, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+            icnt = icnt + 1
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        # x = x.squeeze(2)
+        # time_frame = torch.matmul(x[..., 0], self.irfft_real) - torch.matmul(x[..., 1], self.irfft_imag)
+        # window_frame = time_frame * self.stft_window
+        # overlap_buffer_out = overlap_buffer_in + window_frame
+        # window_sum_out = window_sum_in + self.stft_window_power
+        # window_norm = window_sum_out[..., :self.hop_length]
+        # # window_norm = torch.where(window_norm > 1e-8, window_norm, torch.ones_like(window_norm))
+        # output = overlap_buffer_out[..., :self.hop_length].clone()
+        # x = output / (window_norm + 1e-10)
+        # overlap_buffer_out = torch.cat([overlap_buffer_out[..., self.hop_length:],
+        #                                 torch.zeros([overlap_buffer_in.shape[0], self.hop_length])], dim=-1)
+        # window_sum_out = torch.cat([window_sum_out[..., self.hop_length:],
+        #                             torch.zeros([window_sum_in.shape[0], self.hop_length])], dim=-1)
+        # x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        return (x, cache_stft_out, cache_band0_out, cache_band1_out, cache_band2_out,
+                new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv, lookahead,
+                cache_fus0_out, cache_fus1_out, cache_fus2_out)
+                # overlap_buffer_out, window_sum_out)
+
+    def forward_stft_istft(self, x, cache_stft_in, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, overlap_buffer_in, window_sum_in):
+        # B, C, L = x.shape
+
+        # STFT
+        x_nstft = torch.cat([cache_stft_in, x], dim=-1)
+        cache_stft_out = x_nstft[:, self.hop_length:]
+        frames_windowed_nstft = x_nstft * self.stft_window
+        real_part_nstft = torch.matmul(frames_windowed_nstft, self.rfft_real)
+        imag_part_nstft = torch.matmul(frames_windowed_nstft, self.rfft_imag)
+        x_nstft = torch.cat([real_part_nstft.unsqueeze(-1), imag_part_nstft.unsqueeze(-1)], dim=-1)
+        x_nstft = x_nstft.unsqueeze(-2)
+        # x = torch.view_as_real(x)
+
+        L = x.shape[-1]
+        x = x.reshape(-1, L)
+        # x = torch.stft(x, **self.stft_config, pad_mode='constant', window=self.stft_window, return_complex=True)
+        x = torch.view_as_real(x)
+
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        # # std = x.std(dim=(1, 2, 3), keepdim=True)
+        # # x = (x - mean) / (1e-5 + std)
+        #
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = self.separation_net(x)
+        #
+        # decoder
+        icnt = 0
+        for fusion_layer, su_layer in self.decoder:
+            if icnt == 0:
+                x, cache_fus0_out = fusion_layer(x, cache_fus0_in, save_skip.pop())
+            elif icnt == 1:
+                x, cache_fus1_out = fusion_layer(x, cache_fus1_in, save_skip.pop())
+            elif icnt == 2:
+                x, cache_fus2_out = fusion_layer(x, cache_fus2_in, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+            icnt = icnt + 1
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        x = x.squeeze(2)
+        time_frame = torch.matmul(x[..., 0], self.irfft_real) - torch.matmul(x[..., 1], self.irfft_imag)
+        window_frame = time_frame * self.stft_window
+        overlap_buffer_out = overlap_buffer_in + window_frame
+        window_sum_out = window_sum_in + self.stft_window_power
+        window_norm = window_sum_out[..., :self.hop_length]
+        # window_norm = torch.where(window_norm > 1e-8, window_norm, torch.ones_like(window_norm))
+        output = overlap_buffer_out[..., :self.hop_length].clone()
+        x = output / (window_norm + 1e-10)
+        # x = output / window_norm
+        overlap_buffer_out = torch.cat([overlap_buffer_out[..., self.hop_length:],
+                                        torch.zeros([overlap_buffer_in.shape[0], self.hop_length])], dim=-1)
+        window_sum_out = torch.cat([window_sum_out[..., self.hop_length:],
+                                    torch.zeros([window_sum_in.shape[0], self.hop_length])], dim=-1)
+        x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        # cache_stft_out = cache_stft_in
+        # overlap_buffer_out, window_sum_out = overlap_buffer_in, window_sum_in
+        # x = x[:, :, :, :-padding]
+        return (x, cache_stft_out, cache_band0_out, cache_band1_out, cache_band2_out,
+                cache_fus0_out, cache_fus1_out, cache_fus2_out, overlap_buffer_out, window_sum_out)
+
+
+
+class SCNetStreamNoSTFT(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 64],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=2,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        # stft parameter
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_window_power", self.stft_window ** 2, persistent=False)
+        rfft_real, rfft_imag = self.create_rfft_matrix(nfft)
+        scale = 1.0 / math.sqrt(nfft)
+        self.scale = scale
+        self.register_buffer("rfft_real", rfft_real.T * scale, persistent=False)
+        self.register_buffer("rfft_imag", rfft_imag.T * scale, persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        irfft_real, irfft_imag = self.create_irfft_matrix(nfft)
+        self.register_buffer("irfft_real", irfft_real.T * scale, persistent=False)
+        self.register_buffer("irfft_imag", irfft_imag.T * scale, persistent=False)
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblockStream(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayerStream(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        self.separation_net = SeparationNetStream(
+            channels=dims[-1],
+            expand=expand,
+            num_layers=num_dplayer,
+        )
+
+    def create_rfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = int(n_fft / 2) + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(1)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(0)
+
+        angle = -2.0 * math.pi * k * n / n_fft
+
+        rfft_real = torch.cos(angle).to(dtype)
+        rfft_imag = torch.sin(angle).to(dtype)
+
+        return rfft_real, rfft_imag
+
+    def create_irfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = n_fft // 2 + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(0)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(1)
+
+        angle = 2.0 * math.pi * k * n / n_fft
+
+        irfft_real = torch.cos(angle).to(dtype)
+        irfft_imag = torch.sin(angle).to(dtype)
+
+        scale = torch.ones(freq_size, dtype=dtype)
+        scale[1:-1] = 2.0
+        irfft_real = irfft_real * scale.unsqueeze(0)
+        irfft_imag = irfft_imag * scale.unsqueeze(0)
+
+        return irfft_real, irfft_imag
+
+    def forward_1st_frame(self, x, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, save_skip_in):
+        B, C, Fr, T = x.shape
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        (x, new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2,
+         new_cache_conv) = self.separation_net.forward_1st_frame(x, cache_h1, cache_c1, cache_h2, cache_c2, cache_conv)
+
+        return (None, cache_band0_out, cache_band1_out, cache_band2_out,
+                new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, save_skip)
+
+    def forward(self, x, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, save_skip_in):
+        # STFT
+        # x = torch.cat([cache_stft_in, x], dim=-1)
+        # cache_stft_out = x[:, self.hop_length:]
+        # frames_windowed = x * self.stft_window
+        # real_part = torch.matmul(frames_windowed, self.rfft_real)
+        # imag_part = torch.matmul(frames_windowed, self.rfft_imag)
+        #
+        # x = torch.cat([real_part.unsqueeze(-1), imag_part.unsqueeze(-1)], dim=-1)
+        # x = x.unsqueeze(-2)
+        # # x = torch.view_as_real(x)
+        # x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+        #                                   x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x, new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv = self.separation_net(x, cache_h1, cache_c1, cache_h2, cache_c2, cache_conv)
+        # decoder
+        icnt = 0
+        for fusion_layer, su_layer in self.decoder:
+            if icnt == 0:
+                x, cache_fus0_out = fusion_layer(x, cache_fus0_in, save_skip_in.pop())
+            elif icnt == 1:
+                x, cache_fus1_out = fusion_layer(x, cache_fus1_in, save_skip_in.pop())
+            elif icnt == 2:
+                x, cache_fus2_out = fusion_layer(x, cache_fus2_in, save_skip_in.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+            icnt = icnt + 1
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        # x = x.squeeze(2)
+        # time_frame = torch.matmul(x[..., 0], self.irfft_real) - torch.matmul(x[..., 1], self.irfft_imag)
+        # window_frame = time_frame * self.stft_window
+        # overlap_buffer_out = overlap_buffer_in + window_frame
+        # window_sum_out = window_sum_in + self.stft_window_power
+        # window_norm = window_sum_out[..., :self.hop_length]
+        # # window_norm = torch.where(window_norm > 1e-8, window_norm, torch.ones_like(window_norm))
+        # output = overlap_buffer_out[..., :self.hop_length].clone()
+        # x = output / (window_norm + 1e-10)
+        # overlap_buffer_out = torch.cat([overlap_buffer_out[..., self.hop_length:],
+        #                                 torch.zeros([overlap_buffer_in.shape[0], self.hop_length])], dim=-1)
+        # window_sum_out = torch.cat([window_sum_out[..., self.hop_length:],
+        #                             torch.zeros([window_sum_in.shape[0], self.hop_length])], dim=-1)
+        # x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        # cache_stft_out = cache_stft_in
+        # overlap_buffer_out, window_sum_out = overlap_buffer_in, window_sum_in
+        # x = x[:, :, :, :-padding]
+        return (x,  cache_band0_out, cache_band1_out, cache_band2_out,
+                new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv,
+                cache_fus0_out, cache_fus1_out, cache_fus2_out, save_skip)
+
+    def forward_last_frame(self, x, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, save_skip_in):
+        B, Fr = 1, 2049
+        save_lengths = deque()
+        save_lengths.append([359, 201, 56])
+        save_lengths.append([108, 61, 17])
+        save_lengths.append([33, 19, 5])
+        save_original_lengths = deque()
+        save_original_lengths.append([359, 803, 887])
+        save_original_lengths.append([108, 242, 266])
+        save_original_lengths.append([33, 73, 80])
+
+        (x, new_cache_h1, new_cache_c1,
+         new_cache_h2, new_cache_c2, new_cache_conv) = self.separation_net.forward_last_frame(x, cache_h1, cache_c1, cache_h2, cache_c2, cache_conv)
+        # decoder
+        icnt = 0
+        for fusion_layer, su_layer in self.decoder:
+            if icnt == 0:
+                x, cache_fus0_out = fusion_layer(x, cache_fus0_in, save_skip_in.pop())
+            elif icnt == 1:
+                x, cache_fus1_out = fusion_layer(x, cache_fus1_in, save_skip_in.pop())
+            elif icnt == 2:
+                x, cache_fus2_out = fusion_layer(x, cache_fus2_in, save_skip_in.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+            icnt = icnt + 1
+
+        # # output
+        T = x.shape[-1]
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+
+        return (x, cache_band0_in, cache_band1_in, cache_band2_in,
+                new_cache_h1, new_cache_c1, new_cache_h2, new_cache_c2, new_cache_conv,
+                cache_fus0_out, cache_fus1_out, cache_fus2_out, None)
+
+class SCNetBandPartialChannel2Stream(nn.Module):
+    """
+    The implementation of SCNet: Sparse Compression Network for Music Source Separation. Paper: https://arxiv.org/abs/2401.13276.pdf
+
+    Args:
+    - sources (List[str]): List of sources to be separated.
+    - audio_channels (int): Number of audio channels.
+    - nfft (int): Number of FFTs to determine the frequency dimension of the input.
+    - hop_size (int): Hop size for the STFT.
+    - win_size (int): Window size for STFT.
+    - normalized (bool): Whether to normalize the STFT.
+    - dims (List[int]): List of channel dimensions for each block.
+    - band_SR (List[float]): The proportion of each frequency band.
+    - band_stride (List[int]): The down-sampling ratio of each frequency band.
+    - band_kernel (List[int]): The kernel sizes for down-sampling convolution in each frequency band
+    - conv_depths (List[int]): List specifying the number of convolution modules in each SD block.
+    - compress (int): Compression factor for convolution module.
+    - conv_kernel (int): Kernel size for convolution layer in convolution module.
+    - num_dplayer (int): Number of dual-path layers.
+    - expand (int): Expansion factor in the dual-path RNN, default is 1.
+
+    """
+
+    def __init__(self,
+                 sources=['drums', 'bass', 'other', 'vocals'],
+                 audio_channels=2,
+                 # Main structure
+                 dims=[4, 64, 128, 128],  # dims = [4, 64, 128, 256] in SCNet-large
+                 # STFT
+                 nfft=4096,
+                 hop_size=1024,
+                 win_size=4096,
+                 normalized=True,
+                 # SD/SU layer
+                 band_SR=[0.175, 0.392, 0.433],
+                 band_stride=[1, 4, 16],
+                 band_kernel=[3, 4, 16],
+                 # Convolution Module
+                 conv_depths=[3, 2, 1],
+                 compress=4,
+                 conv_kernel=3,
+                 # Dual-path RNN
+                 num_dplayer=6,
+                 expand=1,
+                 ):
+        super().__init__()
+        self.sources = sources
+        self.audio_channels = audio_channels
+        self.dims = dims
+        band_keys = ['low', 'mid', 'high']
+        self.band_configs = {band_keys[i]: {'SR': band_SR[i], 'stride': band_stride[i], 'kernel': band_kernel[i]} for i
+                             in range(len(band_keys))}
+        self.hop_length = hop_size
+        self.conv_config = {
+            'compress': compress,
+            'kernel': conv_kernel,
+        }
+        # stft parameter
+        self.register_buffer("stft_window", torch.hann_window(nfft), persistent=False)
+        self.register_buffer("stft_window_power", self.stft_window ** 2, persistent=False)
+        rfft_real, rfft_imag = self.create_rfft_matrix(nfft)
+        scale = 1.0 / math.sqrt(nfft)
+        self.scale = scale
+        self.register_buffer("rfft_real", rfft_real.T * scale, persistent=False)
+        self.register_buffer("rfft_imag", rfft_imag.T * scale, persistent=False)
+
+        self.stft_config = {
+            'n_fft': nfft,
+            'hop_length': hop_size,
+            'win_length': win_size,
+            'center': True,
+            'normalized': True
+        }
+
+        irfft_real, irfft_imag = self.create_irfft_matrix(nfft)
+        self.register_buffer("irfft_real", irfft_real.T * scale, persistent=False)
+        self.register_buffer("irfft_imag", irfft_imag.T * scale, persistent=False)
+
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
+        for index in range(len(dims) - 1):
+            enc = SDblockStream(
+                channels_in=dims[index],
+                channels_out=dims[index + 1],
+                band_configs=self.band_configs,
+                conv_config=self.conv_config,
+                depths=conv_depths
+            )
+            self.encoder.append(enc)
+
+            dec = nn.Sequential(
+                FusionLayerStream(channels=dims[index + 1]),
+                SUlayer(
+                    channels_in=dims[index + 1],
+                    channels_out=dims[index] if index != 0 else dims[index] * len(sources),
+                    band_configs=self.band_configs,
+                )
+            )
+            self.decoder.insert(0, dec)
+
+        # self.separation_net = SeparationNet(
+        #     channels=dims[-1],
+        #     expand=expand,
+        #     num_layers=num_dplayer,
+        # )
+
+        self.separation_net = SeparationNet(128, 64, 64)
+
+    def create_rfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = int(n_fft / 2) + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(1)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(0)
+
+        angle = -2.0 * math.pi * k * n / n_fft
+
+        rfft_real = torch.cos(angle).to(dtype)
+        rfft_imag = torch.sin(angle).to(dtype)
+
+        return rfft_real, rfft_imag
+
+    def create_irfft_matrix(self, n_fft, dtype=torch.float32):
+        """创建 RFFT 矩阵（实部和虚部分开）"""
+        freq_size = n_fft // 2 + 1
+
+        k = torch.arange(freq_size, dtype=torch.float64).unsqueeze(0)
+        n = torch.arange(n_fft, dtype=torch.float64).unsqueeze(1)
+
+        angle = 2.0 * math.pi * k * n / n_fft
+
+        irfft_real = torch.cos(angle).to(dtype)
+        irfft_imag = torch.sin(angle).to(dtype)
+
+        scale = torch.ones(freq_size, dtype=dtype)
+        scale[1:-1] = 2.0
+        irfft_real = irfft_real * scale.unsqueeze(0)
+        irfft_imag = irfft_imag * scale.unsqueeze(0)
+
+        return irfft_real, irfft_imag
+
+    def forward(self, x, cache_stft_in, cache_band0_in, cache_band1_in, cache_band2_in,
+                cache_fus0_in, cache_fus1_in, cache_fus2_in, overlap_buffer_in, window_sum_in):
+        # B, C, L = x.shape
+        # B = x.shape[0]
+        # In the initial padding, ensure that the number of frames after the STFT (the length of the T dimension) is even,
+        # so that the RFFT operation can be used in the separation network.
+        # padding = self.hop_length - x.shape[-1] % self.hop_length
+        # if (x.shape[-1] + padding) // self.hop_length % 2 == 0:
+        #     padding += self.hop_length
+        # x = F.pad(x, (0, padding))
+
+        # STFT
+        x = torch.cat([cache_stft_in, x], dim=-1)
+        cache_stft_out = x[:, self.hop_length:]
+        frames_windowed = x * self.stft_window
+        real_part = torch.matmul(frames_windowed, self.rfft_real)
+        imag_part = torch.matmul(frames_windowed, self.rfft_imag)
+
+        x = torch.cat([real_part.unsqueeze(-1), imag_part.unsqueeze(-1)], dim=-1)
+        x = x.unsqueeze(-2)
+        # x = torch.view_as_real(x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+        # # mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        # # std = x.std(dim=(1, 2, 3), keepdim=True)
+        # # x = (x - mean) / (1e-5 + std)
+        #
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for icnt, sd_layer in enumerate(self.encoder):
+            if icnt == 0:
+                x, skip, lengths, original_lengths, cache_band0_out = sd_layer(x, cache_band0_in)
+            elif icnt == 1:
+                x, skip, lengths, original_lengths, cache_band1_out = sd_layer(x, cache_band1_in)
+            elif icnt == 2:
+                x, skip, lengths, original_lengths, cache_band2_out = sd_layer(x, cache_band2_in)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # # separation
+        x = x.transpose(2, 3)
+        x = self.separation_net(x)
+        x = x.transpose(2, 3)
+        #
+        # decoder
+        icnt = 0
+        for fusion_layer, su_layer in self.decoder:
+            if icnt == 0:
+                x, cache_fus0_out = fusion_layer(x, cache_fus0_in, save_skip.pop())
+            elif icnt == 1:
+                x, cache_fus1_out = fusion_layer(x, cache_fus1_in, save_skip.pop())
+            elif icnt == 2:
+                x, cache_fus2_out = fusion_layer(x, cache_fus2_in, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+            icnt = icnt + 1
+
+        # # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        # x = x * std[:, None] + mean[:, None]
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        x = x.squeeze(2)
+        time_frame = torch.matmul(x[..., 0], self.irfft_real) - torch.matmul(x[..., 1], self.irfft_imag)
+        window_frame = time_frame * self.stft_window
+        overlap_buffer_out = overlap_buffer_in + window_frame
+        window_sum_out = window_sum_in + self.stft_window_power
+        window_norm = window_sum_out[..., :self.hop_length]
+        # window_norm = torch.where(window_norm > 1e-8, window_norm, torch.ones_like(window_norm))
+        output = overlap_buffer_out[..., :self.hop_length].clone()
+        x = output / (window_norm + 1e-10)
+        # x = output / window_norm
+        overlap_buffer_out = torch.cat([overlap_buffer_out[..., self.hop_length:],
+                                        torch.zeros([overlap_buffer_in.shape[0], self.hop_length])], dim=-1)
+        window_sum_out = torch.cat([window_sum_out[..., self.hop_length:],
+                                    torch.zeros([window_sum_in.shape[0], self.hop_length])], dim=-1)
+        x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+        # cache_stft_out = cache_stft_in
+        # overlap_buffer_out, window_sum_out = overlap_buffer_in, window_sum_in
+        # x = x[:, :, :, :-padding]
+        return (x, cache_stft_out, cache_band0_out, cache_band1_out, cache_band2_out,
+                cache_fus0_out, cache_fus1_out, cache_fus2_out, overlap_buffer_out, window_sum_out)
+
+def test_stft():
+    nfft, hop_length, n = 4096, 1024, 16000
+    torch.manual_seed(42)
+    x = torch.randn([2, n], dtype=torch.float32)
+
+    padding = hop_length - x.shape[-1] % hop_length
+    if (x.shape[-1] + padding) // hop_length % 2 == 0:
+        padding += hop_length
+    x = F.pad(x, (0, padding))
+
+    scnet = SCNet(sources=['accompaniment', 'vocals'])
+    output = scnet(x)
+
+    scnet_stream = SCNetStream(sources=['accompaniment', 'vocals'])
+    cache_stft_state = torch.zeros([2, nfft - hop_length], dtype=torch.float32)
+
+    chunk_size = int(x.shape[-1] / hop_length)
+    stream_output = []
+    for i in range(chunk_size):
+        # input = x[:, i * hop_length:(i + 1) * hop_length]
+        input_chunk = input[..., i * hop_length:(i + 1) * hop_length]
+        chunk_output, cache_stft_state = scnet_stream(input_chunk, cache_stft_state)
+        stream_output.append(chunk_output)
+
+    stream_output = torch.cat(stream_output, dim=-1)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    diff_correct = (stream_output[:, :, 1:] - output.squeeze(0)[:, :, :16]).abs()
+    max_diff_0 = diff_correct[:, :, 0].max().item()
+    mean_diff_0 = diff_correct[:, :, 0].mean().item()
+    max_diff_1 = diff_correct[:, :, 1].max().item()
+    mean_diff_1 = diff_correct[:, :, 1].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+    print(f"Correct vs Ref: max diff = {max_diff_1:.6e}, mean diff = {mean_diff_1:.6e}")
+
+
+def convert_state_dict(src_net, dst_net):
+    state_dict = src_net.state_dict()
+    new_state_dict = dst_net.state_dict()
+    for k, v in state_dict.items():
+        if k in state_dict.keys():
+            new_state_dict[k] = v
+        else:
+            print(k, v)
+    dst_net.load_state_dict(new_state_dict)
+
+
+def test_sdlayerbandpartialchannel2_with_onnx():
+    nfft, hop_length, n = 4096, 1024, 16000
+    torch.manual_seed(42)
+    x = torch.randn([2, n], dtype=torch.float32)
+
+    padding = hop_length - x.shape[-1] % hop_length
+    if (x.shape[-1] + padding) // hop_length % 2 == 0:
+        padding += hop_length
+    x = F.pad(x, (0, padding))
+    pad_x = F.pad(x, (hop_length, 0))
+
+    scnet = SCNet(sources=['accompaniment', 'vocals'])
+    scnet.eval()
+    with torch.no_grad():
+        output = scnet(x)
+
+    scnet_stream = SCNetStream(sources=['accompaniment', 'vocals'])
+    convert_state_dict(scnet, scnet_stream)
+
+    scnet_stream.eval()
+    cache_stft_state = torch.zeros([2, nfft - hop_length], dtype=torch.float32)
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1, cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32), torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2, cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32), torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 3], dtype=torch.float32)
+    overlap_buffer_state = torch.zeros([4, 4096], dtype=torch.float32)
+    window_sum_state = torch.zeros([4, 4096], dtype=torch.float32)
+    lookahead = 0
+    state = [cache_stft_state, cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv, lookahead,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state,
+             overlap_buffer_state, window_sum_state]
+    chunk_size = int(x.shape[-1] / hop_length)
+
+    stream_output = []
+    for i in range(chunk_size):
+        with torch.no_grad():
+            input_chunk = x[..., i * hop_length:(i + 1) * hop_length]
+            chunk_output, *state = scnet_stream(input_chunk, *state)
+            if chunk_output is None:
+                continue
+
+        stream_output.append(chunk_output)
+
+    stream_output = torch.cat(stream_output, dim=-1)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    min_len = min(stream_output.shape[-1], output.shape[-1])
+    diff_correct = (stream_output[:, :, :, hop_length * 2:] - output[:, :, :, :min_len - hop_length * 2]).abs()
+    max_diff_0 = diff_correct[:, :, :, :].max().item()
+    mean_diff_0 = diff_correct[:, :, :, :].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+
+def test_stft_op():
+    nfft, win_size, hop_size = 4096, 4096, 1024
+    torch.manual_seed(42)
+    stft_window = torch.hann_window(nfft)
+    center_flag = True
+    stft_config = {
+        'n_fft': nfft,
+        'hop_length': hop_size,
+        'win_length': win_size,
+        'center': center_flag,
+        'normalized': True
+    }
+    torch.manual_seed(42)
+    n = 16000
+    input = torch.randn([2, n], dtype=torch.float32)
+    L = input.shape[-1]
+    stft_x = torch.stft(input , **stft_config, pad_mode='constant', window=stft_window, return_complex=True)
+    output = torch.view_as_real(stft_x)
+    print(output.shape)
+
+    center_flag = False
+    stft_config['center'] = center_flag
+    stft_real = []
+    input_1 = torch.cat([input, torch.zeros([2, hop_size*2], dtype=torch.float32)], dim=-1)
+    cache = torch.zeros([2, hop_size*2], dtype=torch.float32)
+    input_chunk_0 = input_1[:, 0:4*1024]
+    pad_input_chunk0 = torch.cat([cache, input_chunk_0], dim=-1)
+    chunk_stft = torch.stft(pad_input_chunk0, **stft_config, pad_mode='constant', window=stft_window, return_complex=True)
+    cache = pad_input_chunk0[...,3*1024:]
+    stft_real.append(chunk_stft)
+    L = input_1.shape[-1]
+    for i in range(int((L-1024*4)/(1024*3))):
+        start = (i*3+4)*1024
+        end = (i*3+7)*1024
+        chunk = input_1[:, start:end]
+        pad_input_chunk = torch.cat((cache, chunk), dim=-1)
+        cache = pad_input_chunk[:, -hop_size * 3:]
+        chunk_stft = torch.stft(pad_input_chunk, **stft_config, pad_mode='constant', window=stft_window, return_complex=True)
+        stft_real.append(chunk_stft)
+    chunk_end = input_1[:, end:]
+    pad_input_end = torch.cat((cache, chunk_end), dim=-1)
+    # pad_input_end = torch.cat((pad_input_end, torch.zeros([2, hop_size*2], dtype=torch.float32)), dim=-1)
+    chunk_stft = torch.stft(pad_input_end, **stft_config, pad_mode='constant', window=stft_window, return_complex=True)
+    stft_real.append(chunk_stft)
+    stft_real = torch.cat(stft_real, dim=-1)
+    output_real = torch.view_as_real(stft_real)
+    print(output_real.shape)
+
+    min_len = min(output_real.shape[-2], output_real.shape[-1])
+    diff = output[:,:,:min_len, :] - output_real[:,:,:min_len, :]
+    print("max diff: ", diff.abs().max())
+
+def test_istft_op():
+    nfft, win_size, hop_size = 4096, 4096, 1024
+    torch.manual_seed(42)
+    stft_window = torch.hann_window(nfft)
+    stft_window = stft_window
+    center_flag = True
+    stft_config = {
+        'n_fft': nfft,
+        'hop_length': hop_size,
+        'win_length': win_size,
+        'center': center_flag,
+        'normalized': True
+    }
+    torch.manual_seed(42)
+    n = 16
+    input = torch.randn([2049, 16, 2], dtype=torch.float32)
+    L = input.shape[-2]
+    input_cmpx = torch.view_as_complex(input)
+    istft_out = torch.istft(input_cmpx , **stft_config, window=stft_window)
+
+    center_flag = False
+    stft_config['center'] = center_flag
+    conj_index = torch.arange(nfft/2-1, 0, -1).int()
+    L_temp = (L-1)*hop_size + win_size
+    signal_acc = torch.zeros(L_temp, dtype=torch.float32)
+    weight_acc = torch.zeros(L_temp, dtype=torch.float32)
+    window_sq = stft_window ** 2
+    for i in range(int((L))):
+        input_cmpx_chunk = input_cmpx[:, i]
+        input_cmpx_chunk_full =  torch.cat([input_cmpx_chunk, torch.conj(input_cmpx_chunk[conj_index])]) * 64
+        y = torch.fft.ifft(input_cmpx_chunk_full).real
+        y_win = y * stft_window
+        start = i * hop_size
+        signal_acc[start:start + nfft] += y_win
+        weight_acc[start:start + nfft] += window_sq
+
+    output = signal_acc / (weight_acc + 1e-8)
+    diff = output[2048:-2048] - istft_out
+    print('max diff:', diff.abs().max())
+    print('mean diff:', diff.mean())
+
+def test_scnet_nostft():
+    B, C, F, T = 1, 4, 2049, 18
+    torch.manual_seed(42)
+    x = torch.randn([B, C, F, T], dtype=torch.float32)
+
+    scnet = SCNetNoStft(sources=['accompaniment', 'vocals'])
+    scnet.eval()
+    with torch.no_grad():
+        output = scnet(x)
+
+    scnet_stream = SCNetStreamNoSTFT(sources=['accompaniment', 'vocals'])
+    convert_state_dict(scnet, scnet_stream)
+
+    scnet_stream.eval()
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1, cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32), torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2, cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32), torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32)
+    save_skip = None
+    state = [cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
+
+    stream_output = []
+    with torch.no_grad():
+        input_chunk = x[..., 0:3]
+        _, *state = scnet_stream.forward_1st_frame(input_chunk, *state)
+        for i in range(int(T/3)-1):
+            input_chunk = x[..., (i+1)*3:(i+2)*3]
+            chunk_output, *state = scnet_stream(input_chunk, *state)
+            stream_output.append(chunk_output)
+        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        stream_output.append(chunk_output)
+    stream_output = torch.cat(stream_output, dim=-2)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    min_len = min(stream_output.shape[-2], output.shape[-2])
+    diff_correct = (stream_output[:, :, :min_len, :] - output[:, :, :min_len, :]).abs()
+    max_diff_0 = diff_correct[:, :, :, :].max().item()
+    mean_diff_0 = diff_correct[:, :, :, :].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+
+def test_scnet_noistft():
+    hop_size, T = 1024, 16000
+    torch.manual_seed(42)
+    input = torch.randn([2, T], dtype=torch.float32)
+
+    padding = hop_size*3 - (input.shape[-1]-4096) % (hop_size*3)
+    if (input.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    pad_input = F.pad(input, (0, padding))
+    L = pad_input.shape[-1]
+
+    scnet = SCNetNoISTFT(sources=['accompaniment', 'vocals'])
+    scnet.eval()
+    with torch.no_grad():
+        output = scnet(pad_input)
+
+    scnet_stream = SCNetStreamNoSTFT(sources=['accompaniment', 'vocals'])
+    convert_state_dict(scnet, scnet_stream)
+
+    scnet_stream.eval()
+    cache_stft_0 = torch.zeros([2, 2*hop_size], dtype=torch.float32)
+    cache_stft_1 = torch.zeros([2, 3*hop_size], dtype=torch.float32)
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1, cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32), torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2, cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32), torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32)
+    save_skip = None
+    state = [cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
+
+    stream_output = []
+    scnet_stream.stft_config['center'] = False
+    with torch.no_grad():
+        input_chunk = pad_input[..., 0:hop_size*4]
+        stft_x = torch.stft(torch.cat([cache_stft_0, input_chunk], dim=-1), **scnet_stream.stft_config, window=scnet_stream.stft_window, return_complex=True)
+        x = torch.view_as_real(stft_x)
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // 2, x.shape[3] * 2,
+                                          x.shape[1], x.shape[2])
+        _, *state = scnet_stream.forward_1st_frame(x, *state)
+        cache_stft_0 = input_chunk[:, -3*hop_size:]
+        for i in range(int((L-1024*4)/(3*1024))):
+            start = (i*3+4) * hop_size
+            end = (i*3+7) * hop_size
+            input_chunk = pad_input[..., start:end]
+            stft_x = torch.stft(torch.cat([cache_stft_0, input_chunk], dim=-1), **scnet_stream.stft_config,
+                                window=scnet_stream.stft_window, return_complex=True)
+            x = torch.view_as_real(stft_x)
+            x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // 2, x.shape[3] * 2,
+                                              x.shape[1], x.shape[2])
+            cache_stft_0 = input_chunk
+            chunk_output, *state = scnet_stream(x, *state)
+            stream_output.append(chunk_output)
+        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        stream_output.append(chunk_output)
+    stream_output = torch.cat(stream_output, dim=-2)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    min_len = min(stream_output.shape[-2], output.shape[-2])
+    diff_correct = (stream_output[:, :, :min_len, :] - output[:, :, :min_len, :]).abs()
+    max_diff_0 = diff_correct[:, :, :, :].max().item()
+    mean_diff_0 = diff_correct[:, :, :, :].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+
+
+def test_scnet_stft_stream():
+    nfft, win_size, hop_size, n = 4096, 4096, 1024, 16000
+    torch.manual_seed(42)
+    x = torch.randn([2, n], dtype=torch.float32)
+
+    padding = hop_size - x.shape[-1] % hop_size
+    if (x.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    x = F.pad(x, (0, padding))
+    L = x.shape[-1]
+
+    scnet = SCNetNoISTFT(sources=['accompaniment', 'vocals'])
+    scnet.eval()
+    with torch.no_grad():
+        output = scnet(x)
+
+    scnet_stream = SCNetStreamNoISTFT(sources=['accompaniment', 'vocals'])
+    convert_state_dict(scnet, scnet_stream)
+
+    scnet_stream.eval()
+    cache_stft_0 = torch.zeros([2, hop_size*2], dtype=torch.float32)
+    cache_stft_1 = torch.zeros([2, hop_size*2], dtype=torch.float32)
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1, cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32), torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2, cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32), torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32)
+    save_skip = None
+    state = [cache_stft_0, cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
+
+    stream_output = []
+    with torch.no_grad():
+        input_chunk = x[..., 0:4*hop_size]
+        _, *state = scnet_stream.forward_1st_frame(input_chunk, *state)
+        for i in range(int((L-1024*4) / 3072) - 1):
+            input_chunk = x[..., (i + 1) * 3:(i + 2) * 3]
+            chunk_output, *state = scnet_stream(input_chunk, *state)
+            stream_output.append(chunk_output)
+        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        stream_output.append(chunk_output)
+    stream_output = torch.cat(stream_output, dim=-2)
+
+    print(f"Correct output shape: {output.shape}, Reference shape: {stream_output.shape}")
+    # 比较修正后的输出
+    min_len = min(stream_output.shape[-2], output.shape[-2])
+    diff_correct = (stream_output[:, :, :min_len, :] - output[:, :, :min_len, :]).abs()
+    max_diff_0 = diff_correct[:, :, :, :].max().item()
+    mean_diff_0 = diff_correct[:, :, :, :].mean().item()
+    print(f"Correct vs Ref: max diff = {max_diff_0:.6e}, mean diff = {mean_diff_0:.6e}")
+
+def test_scnet():
+    # ------------------------------------------------------------------
+    # 在 nostft 流式基础上加 STFT / ISTFT，与完整 SCNet 波形对齐
+    # STFT: center=True, pad_mode='constant'  <=>  左右各补 n_fft//2 零 + center=False
+    # ------------------------------------------------------------------
+    hop_size, n_fft, T = 1024, 4096, 16000
+    torch.manual_seed(42)
+    input = torch.randn([2, T], dtype=torch.float32)
+
+    # hop 对齐 + 流式 lookahead=3：T_frames = 1 + L/hop 需为奇数且能被 3 整除
+    padding = hop_size - input.shape[-1] % hop_size
+    if (input.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    L = input.shape[-1] + padding
+    t_frames = 1 + L // hop_size
+    if t_frames % 3 != 0:
+        padding += ((3 - t_frames % 3) % 3) * hop_size
+    pad_input = F.pad(input, (0, padding))
+    L = pad_input.shape[-1]
+
+    scnet = SCNet(sources=['accompaniment', 'vocals'])
+    scnet.eval()
+    with torch.no_grad():
+        wave_ref = scnet(pad_input[None])
+
+    scnet_stream = SCNetStreamNoSTFT(sources=['accompaniment', 'vocals'])
+    convert_state_dict(scnet, scnet_stream)
+    scnet_stream.eval()
+
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1, cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32), torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2, cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32), torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32)
+    save_skip = None
+    state = [cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
+
+    pad_input_ext = F.pad(pad_input, (0, 2 * hop_size))
+    L_ext = pad_input_ext.shape[-1]
+    cache_stft_0 = torch.zeros([2, 2 * hop_size], dtype=torch.float32)
+
+    wave_chunks = []
+    n_ola = len(scnet.sources) * scnet.audio_channels
+    overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
+    window_sum = torch.zeros([n_fft], dtype=torch.float32)
+    win = scnet_stream.stft_window
+    win_pow = win * win
+    fft_scale = n_fft ** 0.5
+
+    def push_ola_istft(spec_rt):
+        nonlocal overlap_buffer, window_sum
+        n, _, t_new, _ = spec_rt.shape
+        if t_new == 0:
+            return torch.zeros(n, 0, dtype=spec_rt.dtype, device=spec_rt.device)
+        spec_c = torch.view_as_complex(spec_rt.permute(0, 2, 1, 3).contiguous())
+        frames = torch.fft.irfft(spec_c, n=n_fft, dim=-1).mul_(fft_scale)
+        frames.mul_(win)
+        ola_len = n_fft + (t_new - 1) * hop_size
+        frames_nct = frames.transpose(1, 2).contiguous()
+        ola = F.fold(
+            frames_nct, output_size=(1, ola_len),
+            kernel_size=(1, n_fft), stride=(1, hop_size),
+        ).reshape(n, ola_len)
+        ola[:, :n_fft] += overlap_buffer
+        w_frames = win_pow.view(1, n_fft, 1).expand(1, n_fft, t_new)
+        wola = F.fold(
+            w_frames, output_size=(1, ola_len),
+            kernel_size=(1, n_fft), stride=(1, hop_size),
+        ).reshape(ola_len)
+        wola[:n_fft] += window_sum
+        out_len = t_new * hop_size
+        out = ola[:, :out_len] / (wola[:out_len] + 1e-10)
+        overlap_buffer = F.pad(ola[:, out_len:], (0, hop_size))
+        window_sum = F.pad(wola[out_len:], (0, hop_size))
+        return out
+
+    stft_cfg = dict(scnet_stream.stft_config)
+    stft_cfg['center'] = False
+    with torch.no_grad():
+        input_chunk = pad_input_ext[..., 0:hop_size * 4]
+        stft_x = torch.stft(
+            torch.cat([cache_stft_0, input_chunk], dim=-1),
+            **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
+        )
+        x = torch.view_as_real(stft_x)
+        x = x.permute(0, 3, 1, 2).reshape(
+            x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
+        )
+        _, *state = scnet_stream.forward_1st_frame(x, *state)
+        cache_stft_0 = input_chunk[:, -3 * hop_size:]
+
+        n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+        for i in range(n_mid):
+            start = (i * 3 + 4) * hop_size
+            end = (i * 3 + 7) * hop_size
+            input_chunk = pad_input_ext[..., start:end]
+            stft_x = torch.stft(
+                torch.cat([cache_stft_0, input_chunk], dim=-1),
+                **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
+            )
+            x = torch.view_as_real(stft_x)
+            x = x.permute(0, 3, 1, 2).reshape(
+                x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
+            )
+            cache_stft_0 = input_chunk
+            chunk_output, *state = scnet_stream(x, *state)
+            wave_chunks.append(push_ola_istft(chunk_output))
+
+        chunk_output, *state = scnet_stream.forward_last_frame(None, *state)
+        wave_chunks.append(push_ola_istft(chunk_output))
+        wave_chunks.append(
+            overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+        )
+
+    wave_ola = torch.cat(wave_chunks, dim=-1)
+    pad = n_fft // 2
+    wave_stream = wave_ola[:, pad:pad + L].reshape(wave_ref.shape)
+
+    print(f"[STFT+nostft+OLA_ISTFT] wave_ref={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
+    diff_wave = (wave_stream - wave_ref).abs()
+    print(f"[STFT+nostft+OLA_ISTFT] max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Music Source Separation using SCNet")
+    parser.add_argument('--input_dir', type=str,
+                        default='/home/data1/lixiaohui/_Codes/_Python/001_audio/'
+                                'source_separation/demucs_master/demucs/data/'
+                                '2026-02-02/wav/LBI利比（时柏尘） - 小城夏天_215613356.wav',
+                        help='Input directory containing audio files')
+    parser.add_argument('--output_dir', type=str,
+                        default='../output/scnet_subchannel_MusdbhqMoisedbDsdCCMixterClean_lr3e-4_normTrue_2cls_streamSTFT64-128-64-LSTMTimeUniLastConv1dDplayer2_noscalar_pre103_adjustlr/',
+                        help='Output directory to save separated sources')
+    parser.add_argument('--checkpoint_path', type=str,
+                        default='../result/scnet_subchannel_MusdbhqMoisedbDsdCCMixterClean_lr3e-4_normTrue_2cls_streamSTFT64-128-64-LSTMTimeUniLastConv1dDplayer2_noscalar_pre103_adjustlr/checkpoint_69.th',
+                        help='Path to model checkpoint file')
+    parser.add_argument('--instruments', type=str,
+                        default=['accompaniment', 'vocals'],
+                        help='List of source names to separate')
+    parser.add_argument('--save_dir', type=str,
+                        default="./output/小城夏天_215613356",
+                        help='Directory to save separated sources')
+    parser.add_argument('--onnx_dir', type=str,
+                        default=str(Path(__file__).parent / 'onnx'),
+                        help='Directory containing scnet_first.onnx / scnet_mid.onnx')
+    parser.add_argument('--quan_output_path', type=str,
+                        default='./quan_npy',
+                        help='Directory to save quantization calibration npy files')
+    parser.add_argument('--start_sec', type=float, default=0.0,
+                        help='Audio start offset (seconds) for generate_cache_state')
+    parser.add_argument('--duration_sec', type=float, default=10.0,
+                        help='Audio duration (seconds) for generate_cache_state; <=0 means to end')
+    return parser.parse_args()
+
+
+def test_full_scnet():
+    args = parse_args()
+    scnet = SCNet(args.instruments)
+    scnet = load_model(scnet, args.checkpoint_path)
+    scnet.eval()
+
+    audio_data, sample_rate = load_audio(args.input_dir)
+    mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
+    mix = convert_audio(mix, sample_rate, sample_rate, 2)
+    orig_len = mix.shape[-1]
+
+    hop_size, n_fft = 1024, 4096
+
+    # pad：hop 对齐（帧数为奇数）+ 流式 lookahead=3（帧数能被 3 整除）
+    padding = hop_size - mix.shape[-1] % hop_size
+    if (mix.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    L = mix.shape[-1] + padding
+    t_frames = 1 + L // hop_size
+    if t_frames % 3 != 0:
+        padding += ((3 - t_frames % 3) % 3) * hop_size
+    pad_mix = F.pad(mix, (0, padding))
+    L = pad_mix.shape[-1]
+
+    scnet_stream = SCNetStreamNoSTFT(sources=list(args.instruments))
+    convert_state_dict(scnet, scnet_stream)
+    scnet_stream.eval()
+
+    # ------------------------------------------------------------------
+    # 非流式
+    # ------------------------------------------------------------------
+    with torch.no_grad():
+        wave_ref = scnet(pad_mix[None])
+
+    # ------------------------------------------------------------------
+    # 流式：STFT + SCNetStreamNoSTFT(mid) + OLA ISTFT
+    # EOS：pad_mix_ext 多补 3hop 静音，for 多跑一轮 mid 冲 lookahead（无 last）
+    # ------------------------------------------------------------------
+    cache_band0_state = torch.zeros([1, 64, 616, 2], dtype=torch.float32)
+    cache_band1_state = torch.zeros([1, 128, 186, 2], dtype=torch.float32)
+    cache_band2_state = torch.zeros([1, 64, 57, 2], dtype=torch.float32)
+    cache_fus0_state = torch.zeros([1, 128, 57, 2], dtype=torch.float32)
+    cache_fus1_state = torch.zeros([1, 256, 186, 2], dtype=torch.float32)
+    cache_fus2_state = torch.zeros([1, 128, 616, 2], dtype=torch.float32)
+    cache_h1 = torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_c1 = torch.zeros([1, 57, 64], dtype=torch.float32)
+    cache_h2 = torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_c2 = torch.zeros([1, 57, 128], dtype=torch.float32)
+    cache_conv = torch.zeros([57, 128, 6], dtype=torch.float32)
+    save_skip = None
+    state = [cache_band0_state, cache_band1_state, cache_band2_state,
+             cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
+             cache_fus0_state, cache_fus1_state, cache_fus2_state, save_skip]
+
+    # +2hop: center=True 右端；+3hop: EOS 静音，多跑一次 mid 冲掉 lookahead（不用 last）
+    pad_mix_ext = F.pad(pad_mix, (0, 2 * hop_size + 3 * hop_size))
+    L_ext = pad_mix_ext.shape[-1]
+    cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
+
+    wave_chunks = []
+    n_ola = len(scnet_stream.sources) * scnet_stream.audio_channels
+    overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
+    window_sum = torch.zeros([n_fft], dtype=torch.float32)
+    win = scnet_stream.stft_window
+    win_pow = win * win
+    fft_scale = n_fft ** 0.5
+
+    def push_ola_istft(spec_rt):
+        nonlocal overlap_buffer, window_sum
+        n, _, t_new, _ = spec_rt.shape
+        if t_new == 0:
+            return torch.zeros(n, 0, dtype=spec_rt.dtype, device=spec_rt.device)
+        spec_c = torch.view_as_complex(spec_rt.permute(0, 2, 1, 3).contiguous())
+        frames = torch.fft.irfft(spec_c, n=n_fft, dim=-1).mul_(fft_scale)
+        frames.mul_(win)
+        ola_len = n_fft + (t_new - 1) * hop_size
+        frames_nct = frames.transpose(1, 2).contiguous()
+        ola = F.fold(
+            frames_nct, output_size=(1, ola_len),
+            kernel_size=(1, n_fft), stride=(1, hop_size),
+        ).reshape(n, ola_len)
+        ola[:, :n_fft] += overlap_buffer
+        w_frames = win_pow.view(1, n_fft, 1).expand(1, n_fft, t_new)
+        wola = F.fold(
+            w_frames, output_size=(1, ola_len),
+            kernel_size=(1, n_fft), stride=(1, hop_size),
+        ).reshape(ola_len)
+        wola[:n_fft] += window_sum
+        out_len = t_new * hop_size
+        out = ola[:, :out_len] / (wola[:out_len] + 1e-10)
+        overlap_buffer = F.pad(ola[:, out_len:], (0, hop_size))
+        window_sum = F.pad(wola[out_len:], (0, hop_size))
+        return out
+
+    stft_cfg = dict(scnet_stream.stft_config)
+    stft_cfg['center'] = False
+    with torch.no_grad():
+        input_chunk = pad_mix_ext[..., 0:hop_size * 4]
+        stft_x = torch.stft(
+            torch.cat([cache_stft_0, input_chunk], dim=-1),
+            **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
+        )
+        x = torch.view_as_real(stft_x)
+        x = x.permute(0, 3, 1, 2).reshape(
+            x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
+        )
+        _, *state = scnet_stream.forward_1st_frame(x, *state)
+        cache_stft_0 = input_chunk[:, -3 * hop_size:]
+
+        n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+        for i in range(n_mid):
+            start = (i * 3 + 4) * hop_size
+            end = (i * 3 + 7) * hop_size
+            input_chunk = pad_mix_ext[..., start:end]
+            stft_x = torch.stft(
+                torch.cat([cache_stft_0, input_chunk], dim=-1),
+                **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
+            )
+            x = torch.view_as_real(stft_x)
+            x = x.permute(0, 3, 1, 2).reshape(
+                x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
+            )
+            cache_stft_0 = input_chunk
+            chunk_output, *state = scnet_stream(x, *state)
+            wave_chunks.append(push_ola_istft(chunk_output))
+
+        wave_chunks.append(
+            overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+        )
+
+    wave_ola = torch.cat(wave_chunks, dim=-1)
+    pad = n_fft // 2
+    wave_stream = wave_ola[:, pad:pad + L].reshape(wave_ref.shape)
+
+    # 裁回原始长度后对比
+    wave_ref = wave_ref[..., :orig_len]
+    wave_stream = wave_stream[..., :orig_len]
+
+    print(f"[test_full_scnet] non-stream={tuple(wave_ref.shape)}, stream={tuple(wave_stream.shape)}")
+    diff_wave = (wave_stream - wave_ref).abs()
+    print(f"[test_full_scnet] stream(mid+zero EOS) vs non-stream: "
+          f"max diff = {diff_wave.max().item():.6e}, mean diff = {diff_wave.mean().item():.6e}")
+
+    separated_music_arrays = {}
+    output_sample_rates = {}
+    for idx, instrument in enumerate(args.instruments):
+        separated_music_arrays[instrument] = torch.squeeze(wave_ref[0, idx]).detach().cpu().numpy().T
+        output_sample_rates[instrument] = sample_rate
+
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+    save_sources(separated_music_arrays, output_sample_rates, args.save_dir)
+
+    stream_save_dir = args.save_dir + "_stream"
+    separated_stream_arrays = {}
+    stream_sample_rates = {}
+    for idx, instrument in enumerate(args.instruments):
+        separated_stream_arrays[instrument] = torch.squeeze(wave_stream[0, idx]).detach().cpu().numpy().T
+        stream_sample_rates[instrument] = sample_rate
+    save_sources(separated_stream_arrays, stream_sample_rates, stream_save_dir)
+
+
+def test_onnx_inference():
+    """
+    Export first/mid ONNX graphs and run the full streaming pipeline with ORT.
+
+    Host-side STFT + OLA ISTFT stay outside ONNX (same as test_full_scnet).
+    EOS flush uses +3 hop silence and mid only (no last graph).
+    """
+    import onnxruntime as ort
+    from onnx_common import (
+        CACHE_NAMES,
+        STATE_NAMES,
+        FIRST_INPUT_NAMES,
+        FIRST_OUTPUT_NAMES,
+        MID_INPUT_NAMES,
+        MID_OUTPUT_NAMES,
+        FirstONNXWrapper,
+        MidONNXWrapper,
+        export_onnx,
+    )
+
+    args = parse_args()
+    scnet = SCNet(args.instruments)
+    scnet = load_model(scnet, args.checkpoint_path)
+    scnet.eval()
+
+    audio_data, sample_rate = load_audio(args.input_dir)
+    mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
+    mix = convert_audio(mix, sample_rate, sample_rate, 2)
+    orig_len = mix.shape[-1]
+
+    hop_size, n_fft = 1024, 4096
+
+    padding = hop_size - mix.shape[-1] % hop_size
+    if (mix.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    L = mix.shape[-1] + padding
+    t_frames = 1 + L // hop_size
+    if t_frames % 3 != 0:
+        padding += ((3 - t_frames % 3) % 3) * hop_size
+    pad_mix = F.pad(mix, (0, padding))
+    L = pad_mix.shape[-1]
+
+    scnet_stream = SCNetStreamNoSTFT(sources=list(args.instruments))
+    convert_state_dict(scnet, scnet_stream)
+    scnet_stream.eval()
+
+    with torch.no_grad():
+        wave_ref = scnet(pad_mix[None])
+
+    # ------------------------------------------------------------------
+    # Export first / mid ONNX (same wrappers as export_onnx_first/mid.py)
+    # ------------------------------------------------------------------
+    onnx_dir = Path(__file__).parent / "onnx"
+    first_path = onnx_dir / "scnet_first.onnx"
+    mid_path = onnx_dir / "scnet_mid.onnx"
+
+    z = lambda *shape: torch.zeros(*shape, dtype=torch.float32)
+    cache_in = (
+        z(1, 64, 616, 2), z(1, 128, 186, 2), z(1, 64, 57, 2),
+        z(1, 57, 64), z(1, 57, 64), z(1, 57, 128), z(1, 57, 128),
+        z(57, 128, 6),
+        z(1, 128, 57, 2), z(1, 256, 186, 2), z(1, 128, 616, 2),
+    )
+    example_spec = torch.randn(1, 4, 2049, 3)
+    example_state = (
+        *cache_in,
+        z(1, 64, 616, 3), z(1, 128, 186, 3), z(1, 64, 57, 3),
+    )
+
+    export_onnx(
+        FirstONNXWrapper(scnet_stream),
+        (example_spec, *cache_in),
+        first_path,
+        FIRST_INPUT_NAMES,
+        FIRST_OUTPUT_NAMES,
+    )
+    export_onnx(
+        MidONNXWrapper(scnet_stream),
+        (example_spec, *example_state),
+        mid_path,
+        MID_INPUT_NAMES,
+        MID_OUTPUT_NAMES,
+    )
+    print(f"Exported {first_path}")
+    print(f"Exported {mid_path}")
+
+    first_sess = ort.InferenceSession(str(first_path), providers=["CPUExecutionProvider"])
+    mid_sess = ort.InferenceSession(str(mid_path), providers=["CPUExecutionProvider"])
+
+    def make_zero_caches():
+        return [
+            torch.zeros(1, 64, 616, 2), torch.zeros(1, 128, 186, 2), torch.zeros(1, 64, 57, 2),
+            torch.zeros(1, 57, 64), torch.zeros(1, 57, 64),
+            torch.zeros(1, 57, 128), torch.zeros(1, 57, 128),
+            torch.zeros(57, 128, 6),
+            torch.zeros(1, 128, 57, 2), torch.zeros(1, 256, 186, 2), torch.zeros(1, 128, 616, 2),
+        ]
+
+    def wave_to_spec(x_wave):
+        x = x_wave.permute(0, 3, 1, 2).reshape(
+            x_wave.shape[0] // 2, x_wave.shape[3] * 2, x_wave.shape[1], x_wave.shape[2]
+        )
+        return x
+
+    def stft_chunk(input_chunk, cache_stft_0):
+        stft_x = torch.stft(
+            torch.cat([cache_stft_0, input_chunk], dim=-1),
+            **stft_cfg, window=win, return_complex=True,
+        )
+        x = torch.view_as_real(stft_x)
+        return wave_to_spec(x), input_chunk[:, -3 * hop_size:]
+
+    def run_stream(use_ort: bool):
+        state = make_zero_caches() + [None]
+        pad_mix_ext = F.pad(pad_mix, (0, 2 * hop_size + 3 * hop_size))
+        L_ext = pad_mix_ext.shape[-1]
+        cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
+        wave_chunks = []
+        overlap_buffer = torch.zeros([n_ola, n_fft], dtype=torch.float32)
+        window_sum = torch.zeros([n_fft], dtype=torch.float32)
+        ort_state = None
+
+        def push_ola_istft(spec_rt):
+            nonlocal overlap_buffer, window_sum
+            if isinstance(spec_rt, np.ndarray):
+                spec_rt = torch.from_numpy(spec_rt)
+            n, _, t_new, _ = spec_rt.shape
+            if t_new == 0:
+                return torch.zeros(n, 0, dtype=torch.float32)
+            spec_c = torch.view_as_complex(spec_rt.permute(0, 2, 1, 3).contiguous())
+            frames = torch.fft.irfft(spec_c, n=n_fft, dim=-1).mul_(fft_scale)
+            frames.mul_(win)
+            ola_len = n_fft + (t_new - 1) * hop_size
+            frames_nct = frames.transpose(1, 2).contiguous()
+            ola = F.fold(
+                frames_nct, output_size=(1, ola_len),
+                kernel_size=(1, n_fft), stride=(1, hop_size),
+            ).reshape(n, ola_len)
+            ola[:, :n_fft] += overlap_buffer
+            w_frames = win_pow.view(1, n_fft, 1).expand(1, n_fft, t_new)
+            wola = F.fold(
+                w_frames, output_size=(1, ola_len),
+                kernel_size=(1, n_fft), stride=(1, hop_size),
+            ).reshape(ola_len)
+            wola[:n_fft] += window_sum
+            out_len = t_new * hop_size
+            out = ola[:, :out_len] / (wola[:out_len] + 1e-10)
+            overlap_buffer = F.pad(ola[:, out_len:], (0, hop_size))
+            window_sum = F.pad(wola[out_len:], (0, hop_size))
+            return out
+
+        with torch.no_grad():
+            x, cache_stft_0 = stft_chunk(pad_mix_ext[..., 0:hop_size * 4], cache_stft_0)
+            if use_ort:
+                feeds = {FIRST_INPUT_NAMES[0]: x.numpy()}
+                for name, tensor in zip(CACHE_NAMES, state[:11]):
+                    feeds[name] = tensor.numpy()
+                ort_state = first_sess.run(None, feeds)
+            else:
+                _, *state = scnet_stream.forward_1st_frame(x, *state)
+
+            n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+            for i in range(n_mid):
+                start = (i * 3 + 4) * hop_size
+                end = (i * 3 + 7) * hop_size
+                x, cache_stft_0 = stft_chunk(pad_mix_ext[..., start:end], cache_stft_0)
+                if use_ort:
+                    feeds = {MID_INPUT_NAMES[0]: x.numpy()}
+                    for name, val in zip(STATE_NAMES, ort_state):
+                        feeds[name] = val
+                    ort_out = mid_sess.run(None, feeds)
+                    chunk_output = ort_out[0]
+                    ort_state = ort_out[1:]
+                else:
+                    chunk_output, *state = scnet_stream(x, *state)
+                wave_chunks.append(push_ola_istft(chunk_output))
+
+            wave_chunks.append(
+                overlap_buffer[:, :hop_size] / (window_sum[:hop_size] + 1e-10)
+            )
+
+        wave_ola = torch.cat(wave_chunks, dim=-1)
+        pad = n_fft // 2
+        return wave_ola[:, pad:pad + L].reshape(wave_ref.shape)
+
+    stft_cfg = dict(scnet_stream.stft_config)
+    stft_cfg['center'] = False
+    n_ola = len(scnet_stream.sources) * scnet_stream.audio_channels
+    win = scnet_stream.stft_window
+    win_pow = win * win
+    fft_scale = n_fft ** 0.5
+
+    wave_torch = run_stream(use_ort=False)
+    wave_ort = run_stream(use_ort=True)
+
+    wave_ref = wave_ref[..., :orig_len]
+    wave_torch = wave_torch[..., :orig_len]
+    wave_ort = wave_ort[..., :orig_len]
+
+    diff_torch = (wave_torch - wave_ref).abs()
+    diff_ort = (wave_ort - wave_ref).abs()
+    diff_ort_torch = (wave_ort - wave_torch).abs()
+
+    print(f"[test_onnx_inference] ref={tuple(wave_ref.shape)}, "
+          f"torch={tuple(wave_torch.shape)}, ort={tuple(wave_ort.shape)}")
+    print(f"[test_onnx_inference] torch vs ref: max={diff_torch.max().item():.6e}, "
+          f"mean={diff_torch.mean().item():.6e}")
+    print(f"[test_onnx_inference] ort  vs ref: max={diff_ort.max().item():.6e}, "
+          f"mean={diff_ort.mean().item():.6e}")
+    print(f"[test_onnx_inference] ort  vs torch: max={diff_ort_torch.max().item():.6e}, "
+          f"mean={diff_ort_torch.mean().item():.6e}")
+
+
+def generate_cache_state():
+    """
+    Run first/mid ONNX on one audio segment and dump mid-frame calibration npy.
+
+    Mirrors denoise.py: before each mid inference, save spec_in + all cache/state
+    tensors; after inference, save chunk_output (spec_out) for verification.
+
+    Host STFT stays outside ONNX. Only ORT is used for network inference.
+    Segment selection: [--start_sec, --start_sec + --duration_sec).
+    """
+    import onnxruntime as ort
+    from onnx_common import (
+        CACHE_NAMES,
+        STATE_NAMES,
+        FIRST_INPUT_NAMES,
+        MID_INPUT_NAMES,
+    )
+
+    args = parse_args()
+    hop_size, n_fft = 1024, 4096
+    onnx_dir = Path(args.onnx_dir)
+    first_path = onnx_dir / "scnet_first.onnx"
+    mid_path = onnx_dir / "scnet_mid.onnx"
+    if not first_path.exists() or not mid_path.exists():
+        raise FileNotFoundError(
+            f"Missing ONNX models under {onnx_dir}; "
+            "run test_onnx_inference() first to export them."
+        )
+
+    out_dir = Path(args.quan_output_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    audio_data, sample_rate = load_audio(args.input_dir)
+    mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
+    mix = convert_audio(mix, sample_rate, sample_rate, 2)
+
+    start = max(0, int(args.start_sec * sample_rate))
+    if args.duration_sec is not None and args.duration_sec > 0:
+        end = min(mix.shape[-1], start + int(args.duration_sec * sample_rate))
+    else:
+        end = mix.shape[-1]
+    if end <= start:
+        raise ValueError(
+            f"Empty audio segment: start_sec={args.start_sec}, "
+            f"duration_sec={args.duration_sec}, samples={mix.shape[-1]}"
+        )
+    mix = mix[..., start:end]
+    print(f"[generate_cache_state] audio={args.input_dir}, "
+          f"sr={sample_rate}, segment=[{start}:{end}] "
+          f"({mix.shape[-1]} samples, {mix.shape[-1] / sample_rate:.2f}s)")
+
+    # pad：hop 对齐（帧数为奇数）+ 流式 lookahead=3（帧数能被 3 整除）
+    padding = hop_size - mix.shape[-1] % hop_size
+    if (mix.shape[-1] + padding) // hop_size % 2 == 0:
+        padding += hop_size
+    L = mix.shape[-1] + padding
+    t_frames = 1 + L // hop_size
+    if t_frames % 3 != 0:
+        padding += ((3 - t_frames % 3) % 3) * hop_size
+    pad_mix = F.pad(mix, (0, padding))
+    # +2hop: center=True 右端；+3hop: EOS 静音，多跑一次 mid 冲 lookahead
+    pad_mix_ext = F.pad(pad_mix, (0, 2 * hop_size + 3 * hop_size))
+    L_ext = pad_mix_ext.shape[-1]
+
+    first_sess = ort.InferenceSession(str(first_path), providers=["CPUExecutionProvider"])
+    mid_sess = ort.InferenceSession(str(mid_path), providers=["CPUExecutionProvider"])
+
+    # Mid chunk count (same formula as test_onnx_inference / test_full_scnet)
+    n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
+    if n_mid <= 0:
+        raise ValueError(
+            f"Segment too short for mid inference: need more than {4 * hop_size} "
+            f"padded samples, got L_ext={L_ext}"
+        )
+    print(f"[generate_cache_state] n_mid={n_mid}")
+
+    # State shapes for mid graph (fixed F=2049, 3-frame chunk)
+    state_shapes = {
+        "cache_band0": (1, 64, 616, 2),
+        "cache_band1": (1, 128, 186, 2),
+        "cache_band2": (1, 64, 57, 2),
+        "cache_h1": (1, 57, 64),
+        "cache_c1": (1, 57, 64),
+        "cache_h2": (1, 57, 128),
+        "cache_c2": (1, 57, 128),
+        "cache_conv": (57, 128, 6),
+        "cache_fus0": (1, 128, 57, 2),
+        "cache_fus1": (1, 256, 186, 2),
+        "cache_fus2": (1, 128, 616, 2),
+        "skip0": (1, 64, 616, 3),
+        "skip1": (1, 128, 186, 3),
+        "skip2": (1, 64, 57, 3),
+    }
+    spec_in_shape = (1, 4, 2049, 3)
+    chunk_out_shape = (4, 2049, 3, 2)
+
+    # denoise.py style: pack N frames along axis-0 as (N * dim0, *rest)
+    def alloc_save(shape):
+        return np.empty((n_mid * shape[0], *shape[1:]), dtype=np.float32)
+
+    input_save = alloc_save(spec_in_shape)
+    state_saves = {name: alloc_save(shape) for name, shape in state_shapes.items()}
+    output_save = alloc_save(chunk_out_shape)
+
+    win = torch.hann_window(n_fft)
+    stft_cfg = dict(n_fft=n_fft, hop_length=hop_size, win_length=n_fft, center=False)
+
+    def wave_to_spec(x_wave):
+        x = x_wave.permute(0, 3, 1, 2).reshape(
+            x_wave.shape[0] // 2, x_wave.shape[3] * 2, x_wave.shape[1], x_wave.shape[2]
+        )
+        return x
+
+    def stft_chunk(input_chunk, cache_stft_0):
+        stft_x = torch.stft(
+            torch.cat([cache_stft_0, input_chunk], dim=-1),
+            **stft_cfg, window=win, return_complex=True,
+        )
+        x = torch.view_as_real(stft_x)
+        return wave_to_spec(x), input_chunk[:, -3 * hop_size:]
+
+    cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
+    zero_caches = [
+        np.zeros(state_shapes[name], dtype=np.float32) for name in CACHE_NAMES
+    ]
+
+    # first: warm caches / skips (not dumped; mid dumps are for quan)
+    x, cache_stft_0 = stft_chunk(pad_mix_ext[..., 0:hop_size * 4], cache_stft_0)
+    feeds = {FIRST_INPUT_NAMES[0]: x.numpy()}
+    for name, tensor in zip(CACHE_NAMES, zero_caches):
+        feeds[name] = tensor
+    ort_state = first_sess.run(None, feeds)
+
+    for i in range(n_mid):
+        start_i = (i * 3 + 4) * hop_size
+        end_i = (i * 3 + 7) * hop_size
+        x, cache_stft_0 = stft_chunk(pad_mix_ext[..., start_i:end_i], cache_stft_0)
+        spec_in = x.numpy().astype(np.float32)
+
+        # save pre-inference inputs (denoise style)
+        d0 = spec_in_shape[0]
+        input_save[i * d0:(i + 1) * d0] = spec_in
+        for name, val in zip(STATE_NAMES, ort_state):
+            d0 = state_shapes[name][0]
+            state_saves[name][i * d0:(i + 1) * d0] = val
+
+        feeds = {MID_INPUT_NAMES[0]: spec_in}
+        for name, val in zip(STATE_NAMES, ort_state):
+            feeds[name] = val
+        ort_out = mid_sess.run(None, feeds)
+        chunk_output = ort_out[0]
+        ort_state = ort_out[1:]
+
+        d0 = chunk_out_shape[0]
+        output_save[i * d0:(i + 1) * d0] = chunk_output
+
+    np.save(out_dir / "input.npy", input_save)
+    for name, arr in state_saves.items():
+        np.save(out_dir / f"{name}.npy", arr)
+    np.save(out_dir / "output.npy", output_save)
+
+    print(f"[generate_cache_state] saved {n_mid} mid frames to {out_dir}")
+    print(f"  input.npy {input_save.shape}")
+    for name in STATE_NAMES:
+        print(f"  {name}.npy {state_saves[name].shape}")
+    print(f"  output.npy {output_save.shape}")
+
+
+if __name__ == '__main__':
+    # test_full_scnet()
+    # test_onnx_inference()
+    generate_cache_state()
+    # test_scnet()
+    # test_scnet_noistft()
+    # test_scnet_stft_stream()
+    # test_istft_op()
+    # test_stft_op()
+    # test_scnet_nostft()
+    # test_sdlayerbandpartialchannel2_with_onnx()
