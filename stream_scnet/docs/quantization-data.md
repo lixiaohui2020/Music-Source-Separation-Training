@@ -2,14 +2,15 @@
 
 ## `generate_cache_state()`
 
-**目的**：为 ONNX 量化准备校准 npy，参考 `denoise.py` 的 `run_onnx` 打包方式。
+**目的**：为 first / mid ONNX 量化准备校准 npy，参考 `denoise.py` 的保存方式。
 
 **特点**：
 
-- **仅使用 ONNX Runtime** 做网络推理（first 热身 + mid 循环）
-- Host 侧只做 STFT，不做 OLA ISTFT
-- 从音频中按 `--start_sec` / `--duration_sec` 截取片段
-- 每个 mid 帧：**推理前**保存输入与 state，**推理后**保存 `chunk_output`
+- **仅 ORT 推理**（first 一次 + mid 连续 N 帧）
+- Host 只做 STFT；`permute/reshape` 在模型 `forward` 内，STFT 输出 `(2, 2049, 3, 2)` 直接喂 ONNX
+- **随机起点**：`--start_sec < 0` 时从整段音频随机截取（`--quan_seed`）
+- **固定起点**：`--start_sec >= 0` 时使用指定秒数
+- 保存 **first 输入**（spec + 11 caches）+ **mid 连续 10 帧**（默认）输入/状态/输出
 
 ## 前置条件
 
@@ -18,66 +19,68 @@ onnx/scnet_first.onnx
 onnx/scnet_mid.onnx
 ```
 
-若不存在，先运行 `test_onnx_inference()` 导出。
+需与当前 `(2, 2049, 3, 2)` 输入形状一致；可先运行 `test_onnx_inference()` 导出。
 
 ## 运行
 
 ```bash
 cd stream_scnet
+# 随机起点，保存 10 帧 mid
 PYTHONPATH=. python3 -c \
   "from SCNetStreamAudioConv1dChunk import generate_cache_state; generate_cache_state()" \
   --input_dir /path/to/audio.wav \
   --onnx_dir ./onnx \
   --quan_output_path ./quan_npy \
-  --start_sec 30 \
-  --duration_sec 10
-```
+  --mid_frames 10 \
+  --quan_seed 42
 
-或在 `SCNetStreamAudioConv1dChunk.py` 的 `if __name__ == '__main__'` 中调用 `generate_cache_state()`。
+# 固定起点 30s
+PYTHONPATH=. python3 SCNetStreamAudioConv1dChunk.py \
+  --input_dir /path/to/audio.wav \
+  --start_sec 30 \
+  --mid_frames 10
+```
 
 ## 输出文件
 
 目录：`--quan_output_path`（默认 `./quan_npy`）
 
-| 文件 | 形状（N = mid 帧数） | 说明 |
-|------|---------------------|------|
-| `input.npy` | `(N, 4, 2049, 3)` | mid 输入 spec_in |
-| `cache_band0.npy` | `(N, 64, 616, 2)` | 推理前 state |
-| `cache_band1.npy` | `(N, 128, 186, 2)` | |
-| `cache_band2.npy` | `(N, 64, 57, 2)` | |
-| `cache_h1.npy` | `(N, 57, 64)` | |
-| `cache_c1.npy` | `(N, 57, 64)` | |
-| `cache_h2.npy` | `(N, 57, 128)` | |
-| `cache_c2.npy` | `(N, 57, 128)` | |
-| `cache_conv.npy` | `(N*57, 128, 6)` | 首维无 batch |
-| `cache_fus0.npy` | `(N, 128, 57, 2)` | |
-| `cache_fus1.npy` | `(N, 256, 186, 2)` | |
-| `cache_fus2.npy` | `(N, 128, 616, 2)` | |
-| `skip0.npy` | `(N, 64, 616, 3)` | |
-| `skip1.npy` | `(N, 128, 186, 3)` | |
-| `skip2.npy` | `(N, 64, 57, 3)` | |
-| `output.npy` | `(N*4, 2049, 3, 2)` | mid chunk_output，用于量化后校验 |
+### First 图（各 1 条样本）
 
-## 与 denoise.py 的对应关系
+| 文件 | 形状 | 说明 |
+|------|------|------|
+| `first_input.npy` | `(2, 2049, 3, 2)` | first spec_in |
+| `first_cache_band0.npy` … `first_cache_fus2.npy` | 11 个 cache | 零初始化 cache |
+| `meta.json` | — | 起点、帧数、随机种子等 |
 
-| denoise.py | SCNet `generate_cache_state` |
-|------------|------------------------------|
-| 每帧保存 `inp_spec` | 每 mid 帧保存 `input.npy` 一行 |
-| 每帧保存各 state | 每 mid 帧保存 14 个 state npy |
-| `session.run` 后更新 state | first/mid ORT 更新 `ort_state` |
-| `output.npy` 存网络输出 | `output.npy` 存 `chunk_output` |
+### Mid 图（默认 10 帧，denoise 式 axis-0 打包）
 
-## mid 帧数计算
+| 文件 | 形状（N=10） | 说明 |
+|------|-------------|------|
+| `mid_input.npy` | `(N*2, 2049, 3, 2)` | 推理前 spec_in |
+| `mid_cache_*.npy` / `mid_skip*.npy` | `(N, …)` | 推理前 14 个 state |
+| `mid_output.npy` | `(N*4, 2049, 3, 2)` | chunk_output，量化后校验 |
 
-```python
-n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
-# L_ext = len(pad_mix) + 2*hop + 3*hop
+## 所需音频长度
+
+```text
+min_samples = (4 + mid_frames * 3) * hop_size
+            = (4 + 10 * 3) * 1024 = 34816  # 默认 mid_frames=10
 ```
 
-2 秒 44.1kHz 测试音频约 `n_mid=30`。
+随机起点时，音频总长度须 ≥ `min_samples`。
+
+## 与 denoise.py 的对应
+
+| denoise.py | SCNet |
+|------------|-------|
+| 每帧 `inp_spec` | `mid_input.npy` 每帧 2 行 |
+| 每帧 state | `mid_{state}.npy` |
+| `output.npy` | `mid_output.npy` |
+| — | **新增** `first_input.npy` + `first_cache_*.npy` |
 
 ## 后续量化建议
 
-1. 用多段音频、不同 `--start_sec` 生成多份 npy 或合并
-2. 量化工具读取 `input.npy` + 各 state npy 作为校准输入
-3. 量化后用 `output.npy` 对比量化图输出误差
+1. 多段音频、不同 `--quan_seed` 多次生成，合并校准集
+2. first 与 mid 分别用对应 npy 做量化
+3. 用 `mid_output.npy` 对比量化图输出

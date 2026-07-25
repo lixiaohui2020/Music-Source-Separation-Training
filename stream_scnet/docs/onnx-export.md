@@ -59,7 +59,7 @@ STATE_NAMES = (
 
 | 张量 | 形状 |
 |------|------|
-| `spec_in` | `(1, 4, 2049, 3)` |
+| `spec_in` | `(2, 2049, 3, 2)` — raw STFT; permute/reshape 在 `forward` 内 |
 | `spec_out` / chunk_output | `(4, 2049, 3, 2)` |
 | caches | 见 `onnx_common.make_example_state()` |
 

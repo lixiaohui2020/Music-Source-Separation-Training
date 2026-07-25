@@ -1852,6 +1852,8 @@ class SCNetStreamNoSTFT(nn.Module):
     def forward_1st_frame(self, x, cache_band0_in, cache_band1_in, cache_band2_in,
                 cache_h1, cache_c1, cache_h2, cache_c2, cache_conv,
                 cache_fus0_in, cache_fus1_in, cache_fus2_in, save_skip_in):
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
         B, C, Fr, T = x.shape
         save_skip = deque()
         save_lengths = deque()
@@ -1889,8 +1891,8 @@ class SCNetStreamNoSTFT(nn.Module):
         # x = torch.cat([real_part.unsqueeze(-1), imag_part.unsqueeze(-1)], dim=-1)
         # x = x.unsqueeze(-2)
         # # x = torch.view_as_real(x)
-        # x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
-        #                                   x.shape[1], x.shape[2])
+        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+                                          x.shape[1], x.shape[2])
 
         B, C, Fr, T = x.shape
         save_skip = deque()
@@ -2503,8 +2505,6 @@ def test_scnet_noistft():
         input_chunk = pad_input[..., 0:hop_size*4]
         stft_x = torch.stft(torch.cat([cache_stft_0, input_chunk], dim=-1), **scnet_stream.stft_config, window=scnet_stream.stft_window, return_complex=True)
         x = torch.view_as_real(stft_x)
-        x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // 2, x.shape[3] * 2,
-                                          x.shape[1], x.shape[2])
         _, *state = scnet_stream.forward_1st_frame(x, *state)
         cache_stft_0 = input_chunk[:, -3*hop_size:]
         for i in range(int((L-1024*4)/(3*1024))):
@@ -2514,8 +2514,6 @@ def test_scnet_noistft():
             stft_x = torch.stft(torch.cat([cache_stft_0, input_chunk], dim=-1), **scnet_stream.stft_config,
                                 window=scnet_stream.stft_window, return_complex=True)
             x = torch.view_as_real(stft_x)
-            x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // 2, x.shape[3] * 2,
-                                              x.shape[1], x.shape[2])
             cache_stft_0 = input_chunk
             chunk_output, *state = scnet_stream(x, *state)
             stream_output.append(chunk_output)
@@ -2679,9 +2677,6 @@ def test_scnet():
             **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
         )
         x = torch.view_as_real(stft_x)
-        x = x.permute(0, 3, 1, 2).reshape(
-            x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
-        )
         _, *state = scnet_stream.forward_1st_frame(x, *state)
         cache_stft_0 = input_chunk[:, -3 * hop_size:]
 
@@ -2695,9 +2690,6 @@ def test_scnet():
                 **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
             )
             x = torch.view_as_real(stft_x)
-            x = x.permute(0, 3, 1, 2).reshape(
-                x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
-            )
             cache_stft_0 = input_chunk
             chunk_output, *state = scnet_stream(x, *state)
             wave_chunks.append(push_ola_istft(chunk_output))
@@ -2742,10 +2734,14 @@ def parse_args():
     parser.add_argument('--quan_output_path', type=str,
                         default='./quan_npy',
                         help='Directory to save quantization calibration npy files')
-    parser.add_argument('--start_sec', type=float, default=0.0,
-                        help='Audio start offset (seconds) for generate_cache_state')
+    parser.add_argument('--start_sec', type=float, default=-1.0,
+                        help='Audio start offset (seconds) for generate_cache_state; <0 picks random')
     parser.add_argument('--duration_sec', type=float, default=10.0,
-                        help='Audio duration (seconds) for generate_cache_state; <=0 means to end')
+                        help='Legacy segment length hint; generate_cache_state uses --mid_frames instead')
+    parser.add_argument('--mid_frames', type=int, default=10,
+                        help='Number of consecutive mid frames to save for quantization')
+    parser.add_argument('--quan_seed', type=int, default=42,
+                        help='Random seed when --start_sec < 0')
     return parser.parse_args()
 
 
@@ -2852,9 +2848,6 @@ def test_full_scnet():
             **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
         )
         x = torch.view_as_real(stft_x)
-        x = x.permute(0, 3, 1, 2).reshape(
-            x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
-        )
         _, *state = scnet_stream.forward_1st_frame(x, *state)
         cache_stft_0 = input_chunk[:, -3 * hop_size:]
 
@@ -2868,9 +2861,6 @@ def test_full_scnet():
                 **stft_cfg, window=scnet_stream.stft_window, return_complex=True,
             )
             x = torch.view_as_real(stft_x)
-            x = x.permute(0, 3, 1, 2).reshape(
-                x.shape[0] // 2, x.shape[3] * 2, x.shape[1], x.shape[2]
-            )
             cache_stft_0 = input_chunk
             chunk_output, *state = scnet_stream(x, *state)
             wave_chunks.append(push_ola_istft(chunk_output))
@@ -2974,7 +2964,7 @@ def test_onnx_inference():
         z(57, 128, 6),
         z(1, 128, 57, 2), z(1, 256, 186, 2), z(1, 128, 616, 2),
     )
-    example_spec = torch.randn(1, 4, 2049, 3)
+    example_spec = torch.randn(2, 2049, 3, 2)
     example_state = (
         *cache_in,
         z(1, 64, 616, 3), z(1, 128, 186, 3), z(1, 64, 57, 3),
@@ -3009,19 +2999,13 @@ def test_onnx_inference():
             torch.zeros(1, 128, 57, 2), torch.zeros(1, 256, 186, 2), torch.zeros(1, 128, 616, 2),
         ]
 
-    def wave_to_spec(x_wave):
-        x = x_wave.permute(0, 3, 1, 2).reshape(
-            x_wave.shape[0] // 2, x_wave.shape[3] * 2, x_wave.shape[1], x_wave.shape[2]
-        )
-        return x
-
     def stft_chunk(input_chunk, cache_stft_0):
         stft_x = torch.stft(
             torch.cat([cache_stft_0, input_chunk], dim=-1),
             **stft_cfg, window=win, return_complex=True,
         )
         x = torch.view_as_real(stft_x)
-        return wave_to_spec(x), input_chunk[:, -3 * hop_size:]
+        return x, input_chunk[:, -3 * hop_size:]
 
     def run_stream(use_ort: bool):
         state = make_zero_caches() + [None]
@@ -3126,14 +3110,14 @@ def test_onnx_inference():
 
 def generate_cache_state():
     """
-    Run first/mid ONNX on one audio segment and dump mid-frame calibration npy.
+    Run first/mid ONNX on a short audio slice and dump quantization npy.
 
-    Mirrors denoise.py: before each mid inference, save spec_in + all cache/state
-    tensors; after inference, save chunk_output (spec_out) for verification.
-
-    Host STFT stays outside ONNX. Only ORT is used for network inference.
-    Segment selection: [--start_sec, --start_sec + --duration_sec).
+    - Random start when --start_sec < 0 (seed: --quan_seed)
+    - Saves first-graph inputs (spec + 11 zero caches) once
+    - Saves --mid_frames consecutive mid inputs/states and chunk_output
+    - Host STFT only; network inference uses ORT
     """
+    import json
     import onnxruntime as ort
     from onnx_common import (
         CACHE_NAMES,
@@ -3144,6 +3128,7 @@ def generate_cache_state():
 
     args = parse_args()
     hop_size, n_fft = 1024, 4096
+    mid_frames = args.mid_frames
     onnx_dir = Path(args.onnx_dir)
     first_path = onnx_dir / "scnet_first.onnx"
     mid_path = onnx_dir / "scnet_mid.onnx"
@@ -3160,48 +3145,41 @@ def generate_cache_state():
     mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
     mix = convert_audio(mix, sample_rate, sample_rate, 2)
 
-    start = max(0, int(args.start_sec * sample_rate))
-    if args.duration_sec is not None and args.duration_sec > 0:
-        end = min(mix.shape[-1], start + int(args.duration_sec * sample_rate))
+    min_raw = (4 + mid_frames * 3) * hop_size
+    if args.start_sec < 0:
+        rng = np.random.default_rng(args.quan_seed)
+        max_start = mix.shape[-1] - min_raw
+        if max_start <= 0:
+            raise ValueError(
+                f"Audio too short for {mid_frames} mid frames: need >= {min_raw} samples, "
+                f"got {mix.shape[-1]}"
+            )
+        start = int(rng.integers(0, max_start))
     else:
-        end = mix.shape[-1]
-    if end <= start:
-        raise ValueError(
-            f"Empty audio segment: start_sec={args.start_sec}, "
-            f"duration_sec={args.duration_sec}, samples={mix.shape[-1]}"
-        )
+        start = max(0, int(args.start_sec * sample_rate))
+        if start + min_raw > mix.shape[-1]:
+            raise ValueError(
+                f"Segment exceeds audio length: start={start}, need {min_raw} samples, "
+                f"audio has {mix.shape[-1]}"
+            )
+    end = start + min_raw
     mix = mix[..., start:end]
-    print(f"[generate_cache_state] audio={args.input_dir}, "
-          f"sr={sample_rate}, segment=[{start}:{end}] "
-          f"({mix.shape[-1]} samples, {mix.shape[-1] / sample_rate:.2f}s)")
+    print(f"[generate_cache_state] audio={args.input_dir}, sr={sample_rate}, "
+          f"start={start} ({start / sample_rate:.3f}s), "
+          f"len={mix.shape[-1]} samples, mid_frames={mid_frames}")
 
-    # pad：hop 对齐（帧数为奇数）+ 流式 lookahead=3（帧数能被 3 整除）
     padding = hop_size - mix.shape[-1] % hop_size
     if (mix.shape[-1] + padding) // hop_size % 2 == 0:
         padding += hop_size
-    L = mix.shape[-1] + padding
-    t_frames = 1 + L // hop_size
+    t_frames = 1 + (mix.shape[-1] + padding) // hop_size
     if t_frames % 3 != 0:
         padding += ((3 - t_frames % 3) % 3) * hop_size
     pad_mix = F.pad(mix, (0, padding))
-    # +2hop: center=True 右端；+3hop: EOS 静音，多跑一次 mid 冲 lookahead
-    pad_mix_ext = F.pad(pad_mix, (0, 2 * hop_size + 3 * hop_size))
-    L_ext = pad_mix_ext.shape[-1]
 
     first_sess = ort.InferenceSession(str(first_path), providers=["CPUExecutionProvider"])
     mid_sess = ort.InferenceSession(str(mid_path), providers=["CPUExecutionProvider"])
 
-    # Mid chunk count (same formula as test_onnx_inference / test_full_scnet)
-    n_mid = int((L_ext - hop_size * 4) / (3 * hop_size))
-    if n_mid <= 0:
-        raise ValueError(
-            f"Segment too short for mid inference: need more than {4 * hop_size} "
-            f"padded samples, got L_ext={L_ext}"
-        )
-    print(f"[generate_cache_state] n_mid={n_mid}")
-
-    # State shapes for mid graph (fixed F=2049, 3-frame chunk)
-    state_shapes = {
+    cache_shapes = {
         "cache_band0": (1, 64, 616, 2),
         "cache_band1": (1, 128, 186, 2),
         "cache_band2": (1, 64, 57, 2),
@@ -3217,25 +3195,18 @@ def generate_cache_state():
         "skip1": (1, 128, 186, 3),
         "skip2": (1, 64, 57, 3),
     }
-    spec_in_shape = (1, 4, 2049, 3)
+    spec_in_shape = (2, 2049, 3, 2)
     chunk_out_shape = (4, 2049, 3, 2)
 
-    # denoise.py style: pack N frames along axis-0 as (N * dim0, *rest)
-    def alloc_save(shape):
-        return np.empty((n_mid * shape[0], *shape[1:]), dtype=np.float32)
+    def alloc_mid_save(shape):
+        return np.empty((mid_frames * shape[0], *shape[1:]), dtype=np.float32)
 
-    input_save = alloc_save(spec_in_shape)
-    state_saves = {name: alloc_save(shape) for name, shape in state_shapes.items()}
-    output_save = alloc_save(chunk_out_shape)
+    mid_input_save = alloc_mid_save(spec_in_shape)
+    mid_state_saves = {name: alloc_mid_save(shape) for name, shape in cache_shapes.items()}
+    mid_output_save = alloc_mid_save(chunk_out_shape)
 
     win = torch.hann_window(n_fft)
     stft_cfg = dict(n_fft=n_fft, hop_length=hop_size, win_length=n_fft, center=False)
-
-    def wave_to_spec(x_wave):
-        x = x_wave.permute(0, 3, 1, 2).reshape(
-            x_wave.shape[0] // 2, x_wave.shape[3] * 2, x_wave.shape[1], x_wave.shape[2]
-        )
-        return x
 
     def stft_chunk(input_chunk, cache_stft_0):
         stft_x = torch.stft(
@@ -3243,32 +3214,34 @@ def generate_cache_state():
             **stft_cfg, window=win, return_complex=True,
         )
         x = torch.view_as_real(stft_x)
-        return wave_to_spec(x), input_chunk[:, -3 * hop_size:]
+        return x, input_chunk[:, -3 * hop_size:]
 
     cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
-    zero_caches = [
-        np.zeros(state_shapes[name], dtype=np.float32) for name in CACHE_NAMES
-    ]
+    zero_caches = [np.zeros(cache_shapes[name], dtype=np.float32) for name in CACHE_NAMES]
 
-    # first: warm caches / skips (not dumped; mid dumps are for quan)
-    x, cache_stft_0 = stft_chunk(pad_mix_ext[..., 0:hop_size * 4], cache_stft_0)
-    feeds = {FIRST_INPUT_NAMES[0]: x.numpy()}
+    # first graph: save inputs, then run once
+    x, cache_stft_0 = stft_chunk(pad_mix[..., 0:hop_size * 4], cache_stft_0)
+    first_spec = x.numpy().astype(np.float32)
+    np.save(out_dir / "first_input.npy", first_spec)
+    for name, arr in zip(CACHE_NAMES, zero_caches):
+        np.save(out_dir / f"first_{name}.npy", arr)
+
+    feeds = {FIRST_INPUT_NAMES[0]: first_spec}
     for name, tensor in zip(CACHE_NAMES, zero_caches):
         feeds[name] = tensor
     ort_state = first_sess.run(None, feeds)
 
-    for i in range(n_mid):
+    for i in range(mid_frames):
         start_i = (i * 3 + 4) * hop_size
         end_i = (i * 3 + 7) * hop_size
-        x, cache_stft_0 = stft_chunk(pad_mix_ext[..., start_i:end_i], cache_stft_0)
+        x, cache_stft_0 = stft_chunk(pad_mix[..., start_i:end_i], cache_stft_0)
         spec_in = x.numpy().astype(np.float32)
 
-        # save pre-inference inputs (denoise style)
         d0 = spec_in_shape[0]
-        input_save[i * d0:(i + 1) * d0] = spec_in
+        mid_input_save[i * d0:(i + 1) * d0] = spec_in
         for name, val in zip(STATE_NAMES, ort_state):
-            d0 = state_shapes[name][0]
-            state_saves[name][i * d0:(i + 1) * d0] = val
+            d0 = cache_shapes[name][0]
+            mid_state_saves[name][i * d0:(i + 1) * d0] = val
 
         feeds = {MID_INPUT_NAMES[0]: spec_in}
         for name, val in zip(STATE_NAMES, ort_state):
@@ -3278,18 +3251,35 @@ def generate_cache_state():
         ort_state = ort_out[1:]
 
         d0 = chunk_out_shape[0]
-        output_save[i * d0:(i + 1) * d0] = chunk_output
+        mid_output_save[i * d0:(i + 1) * d0] = chunk_output
 
-    np.save(out_dir / "input.npy", input_save)
-    for name, arr in state_saves.items():
-        np.save(out_dir / f"{name}.npy", arr)
-    np.save(out_dir / "output.npy", output_save)
+    np.save(out_dir / "mid_input.npy", mid_input_save)
+    for name, arr in mid_state_saves.items():
+        np.save(out_dir / f"mid_{name}.npy", arr)
+    np.save(out_dir / "mid_output.npy", mid_output_save)
 
-    print(f"[generate_cache_state] saved {n_mid} mid frames to {out_dir}")
-    print(f"  input.npy {input_save.shape}")
+    meta = {
+        "input_audio": str(args.input_dir),
+        "sample_rate": sample_rate,
+        "start_sample": start,
+        "start_sec": start / sample_rate,
+        "mid_frames": mid_frames,
+        "quan_seed": args.quan_seed,
+        "spec_in_shape": list(spec_in_shape),
+        "chunk_out_shape": list(chunk_out_shape),
+    }
+    with open(out_dir / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[generate_cache_state] saved first + {mid_frames} mid frames to {out_dir}")
+    print(f"  first_input.npy {first_spec.shape}")
+    for name in CACHE_NAMES:
+        print(f"  first_{name}.npy {cache_shapes[name]}")
+    print(f"  mid_input.npy {mid_input_save.shape}")
     for name in STATE_NAMES:
-        print(f"  {name}.npy {state_saves[name].shape}")
-    print(f"  output.npy {output_save.shape}")
+        print(f"  mid_{name}.npy {mid_state_saves[name].shape}")
+    print(f"  mid_output.npy {mid_output_save.shape}")
+    print(f"  meta.json start_sec={meta['start_sec']:.3f}")
 
 
 if __name__ == '__main__':

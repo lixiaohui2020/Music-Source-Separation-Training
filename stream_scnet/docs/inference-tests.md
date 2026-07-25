@@ -12,8 +12,9 @@
 | `--save_dir` | 非流式输出目录 | `./output/...` |
 | `--onnx_dir` | ONNX 模型目录 | `./onnx` |
 | `--quan_output_path` | 量化 npy 输出目录 | `./quan_npy` |
-| `--start_sec` | 量化数据起始秒 | `0.0` |
-| `--duration_sec` | 量化数据时长（秒，≤0 到末尾） | `10.0` |
+| `--start_sec` | 量化起点（秒）；`<0` 随机 | `-1.0` |
+| `--mid_frames` | 连续 mid 帧数 | `10` |
+| `--quan_seed` | 随机起点种子 | `42` |
 
 ---
 

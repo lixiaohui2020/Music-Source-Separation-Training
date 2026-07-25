@@ -81,8 +81,8 @@ def main():
     last = LastONNXWrapper(model).eval()
 
     torch.manual_seed(1234)
-    spec_first = torch.randn(1, 4, 2049, 3)
-    spec_mid = torch.randn(1, 4, 2049, 3)
+    spec_first = torch.randn(2, 2049, 3, 2)
+    spec_mid = torch.randn(2, 2049, 3, 2)
     cache_state = make_example_state()[:11]
 
     with torch.no_grad():

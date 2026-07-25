@@ -1,5 +1,16 @@
 # 变更记录
 
+## 2026-07-25
+
+### 修改
+
+- **`SCNetStreamNoSTFT.forward` / `forward_1st_frame`**：`permute+reshape` 移入 forward；ONNX/Host STFT 输入改为 `(2, 2049, 3, 2)`。
+- **`generate_cache_state()`**：
+  - 随机起点（`--start_sec < 0`）+ 固定 `--mid_frames`（默认 10）
+  - 保存 **first** 输入（`first_input.npy` + `first_cache_*.npy`）
+  - 保存 **mid** 连续 N 帧（`mid_input.npy` / `mid_*.npy` / `mid_output.npy`）
+- 流式测试路径去掉外部 `wave_to_spec`，与 ONNX 输入一致。
+
 ## 2026-07-24
 
 分支：`cursor/scnet-streaming-stft-005f`

@@ -17,7 +17,7 @@ from onnx_common import (
 def main():
     model = make_stream_model()
     wrapper = MidONNXWrapper(model)
-    spec_in = torch.randn(1, 4, 2049, 3)
+    spec_in = torch.randn(2, 2049, 3, 2)
     path = Path(__file__).parent / "onnx" / "scnet_mid.onnx"
     export_onnx(wrapper, (spec_in, *make_example_state()), path, MID_INPUT_NAMES, MID_OUTPUT_NAMES)
     print(f"Exported and simplified {path}")
