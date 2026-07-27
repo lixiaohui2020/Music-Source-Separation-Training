@@ -2734,12 +2734,12 @@ def parse_args():
     parser.add_argument('--quan_output_path', type=str,
                         default='./quan_npy',
                         help='Directory to save quantization calibration npy files')
+    parser.add_argument('--quan_list', type=str, default='',
+                        help='Text file with one audio path per line for batch quantization')
     parser.add_argument('--start_sec', type=float, default=-1.0,
-                        help='Audio start offset (seconds) for generate_cache_state; <0 picks random')
-    parser.add_argument('--duration_sec', type=float, default=10.0,
-                        help='Legacy segment length hint; generate_cache_state uses --mid_frames instead')
+                        help='Segment start (seconds); <0 picks random per file')
     parser.add_argument('--mid_frames', type=int, default=10,
-                        help='Number of consecutive mid frames to save for quantization')
+                        help='Consecutive mid frames saved per audio file')
     parser.add_argument('--quan_seed', type=int, default=42,
                         help='Random seed when --start_sec < 0')
     return parser.parse_args()
@@ -3110,12 +3110,20 @@ def test_onnx_inference():
 
 def generate_cache_state():
     """
-    Run first/mid ONNX on a short audio slice and dump quantization npy.
+    Batch-generate first/mid ONNX quantization npy from many audio files.
 
-    - Random start when --start_sec < 0 (seed: --quan_seed)
-    - Saves first-graph inputs (spec + 11 zero caches) once
-    - Saves --mid_frames consecutive mid inputs/states and chunk_output
-    - Host STFT only; network inference uses ORT
+    For each audio file (typical N=1000+):
+      1. Host STFT on a short segment (random start when --start_sec < 0)
+      2. first ONNX: save spec_in + zero caches; run once -> 14 output states
+      3. mid ONNX: initial state = first output only (reset per file);
+         save --mid_frames consecutive mid inputs/states/outputs
+
+    Output layout (denoise-style axis-0 packing):
+      first_input.npy          (N*2, 2049, 3, 2)
+      first_{cache}.npy        (N, ...)  — zero cache inputs
+      mid_input.npy            (N*mid_frames*2, 2049, 3, 2)
+      mid_{state}.npy          (N*mid_frames, ...)
+      mid_output.npy           (N*mid_frames*4, 2049, 3, 2)
     """
     import json
     import onnxruntime as ort
@@ -3129,6 +3137,8 @@ def generate_cache_state():
     args = parse_args()
     hop_size, n_fft = 1024, 4096
     mid_frames = args.mid_frames
+    min_raw = (4 + mid_frames * 3) * hop_size
+
     onnx_dir = Path(args.onnx_dir)
     first_path = onnx_dir / "scnet_first.onnx"
     mid_path = onnx_dir / "scnet_mid.onnx"
@@ -3141,43 +3151,21 @@ def generate_cache_state():
     out_dir = Path(args.quan_output_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    audio_data, sample_rate = load_audio(args.input_dir)
-    mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
-    mix = convert_audio(mix, sample_rate, sample_rate, 2)
-
-    min_raw = (4 + mid_frames * 3) * hop_size
-    if args.start_sec < 0:
-        rng = np.random.default_rng(args.quan_seed)
-        max_start = mix.shape[-1] - min_raw
-        if max_start <= 0:
-            raise ValueError(
-                f"Audio too short for {mid_frames} mid frames: need >= {min_raw} samples, "
-                f"got {mix.shape[-1]}"
-            )
-        start = int(rng.integers(0, max_start))
+    # ------------------------------------------------------------------
+    # Collect audio paths: quan_list > input_dir(directory) > single file
+    # ------------------------------------------------------------------
+    audio_paths = []
+    if args.quan_list:
+        with open(args.quan_list, encoding='utf-8') as f:
+            audio_paths = [ln.strip() for ln in f if ln.strip()]
+    elif Path(args.input_dir).is_dir():
+        for ext in ('*.wav', '*.flac', '*.mp3', '*.ogg'):
+            audio_paths.extend(str(p) for p in sorted(Path(args.input_dir).glob(ext)))
     else:
-        start = max(0, int(args.start_sec * sample_rate))
-        if start + min_raw > mix.shape[-1]:
-            raise ValueError(
-                f"Segment exceeds audio length: start={start}, need {min_raw} samples, "
-                f"audio has {mix.shape[-1]}"
-            )
-    end = start + min_raw
-    mix = mix[..., start:end]
-    print(f"[generate_cache_state] audio={args.input_dir}, sr={sample_rate}, "
-          f"start={start} ({start / sample_rate:.3f}s), "
-          f"len={mix.shape[-1]} samples, mid_frames={mid_frames}")
+        audio_paths = [args.input_dir]
 
-    padding = hop_size - mix.shape[-1] % hop_size
-    if (mix.shape[-1] + padding) // hop_size % 2 == 0:
-        padding += hop_size
-    t_frames = 1 + (mix.shape[-1] + padding) // hop_size
-    if t_frames % 3 != 0:
-        padding += ((3 - t_frames % 3) % 3) * hop_size
-    pad_mix = F.pad(mix, (0, padding))
-
-    first_sess = ort.InferenceSession(str(first_path), providers=["CPUExecutionProvider"])
-    mid_sess = ort.InferenceSession(str(mid_path), providers=["CPUExecutionProvider"])
+    if not audio_paths:
+        raise ValueError("No audio files found; set --quan_list or --input_dir")
 
     cache_shapes = {
         "cache_band0": (1, 64, 616, 2),
@@ -3198,88 +3186,167 @@ def generate_cache_state():
     spec_in_shape = (2, 2049, 3, 2)
     chunk_out_shape = (4, 2049, 3, 2)
 
-    def alloc_mid_save(shape):
-        return np.empty((mid_frames * shape[0], *shape[1:]), dtype=np.float32)
+    n_files = len(audio_paths)
+    rng = np.random.default_rng(args.quan_seed)
 
-    mid_input_save = alloc_mid_save(spec_in_shape)
-    mid_state_saves = {name: alloc_mid_save(shape) for name, shape in cache_shapes.items()}
-    mid_output_save = alloc_mid_save(chunk_out_shape)
+    first_input_save = np.empty((n_files * spec_in_shape[0], *spec_in_shape[1:]), dtype=np.float32)
+    first_cache_saves = {
+        name: np.zeros((n_files * cache_shapes[name][0], *cache_shapes[name][1:]), dtype=np.float32)
+        for name in CACHE_NAMES
+    }
+    mid_input_save = np.empty((n_files * mid_frames * spec_in_shape[0], *spec_in_shape[1:]), dtype=np.float32)
+    mid_state_saves = {
+        name: np.empty((n_files * mid_frames * cache_shapes[name][0], *cache_shapes[name][1:]), dtype=np.float32)
+        for name in cache_shapes
+    }
+    mid_output_save = np.empty(
+        (n_files * mid_frames * chunk_out_shape[0], *chunk_out_shape[1:]), dtype=np.float32,
+    )
 
+    first_sess = ort.InferenceSession(str(first_path), providers=["CPUExecutionProvider"])
+    mid_sess = ort.InferenceSession(str(mid_path), providers=["CPUExecutionProvider"])
     win = torch.hann_window(n_fft)
     stft_cfg = dict(n_fft=n_fft, hop_length=hop_size, win_length=n_fft, center=False)
-
-    def stft_chunk(input_chunk, cache_stft_0):
-        stft_x = torch.stft(
-            torch.cat([cache_stft_0, input_chunk], dim=-1),
-            **stft_cfg, window=win, return_complex=True,
-        )
-        x = torch.view_as_real(stft_x)
-        return x, input_chunk[:, -3 * hop_size:]
-
-    cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
     zero_caches = [np.zeros(cache_shapes[name], dtype=np.float32) for name in CACHE_NAMES]
 
-    # first graph: save inputs, then run once
-    x, cache_stft_0 = stft_chunk(pad_mix[..., 0:hop_size * 4], cache_stft_0)
-    first_spec = x.numpy().astype(np.float32)
-    np.save(out_dir / "first_input.npy", first_spec)
-    for name, arr in zip(CACHE_NAMES, zero_caches):
+    def stft_first_spec(pad_mix):
+        cache_stft_0 = torch.zeros([pad_mix.shape[0], 2 * hop_size], dtype=pad_mix.dtype)
+        first_chunk = pad_mix[..., 0:hop_size * 4]
+        stft_x = torch.stft(
+            torch.cat([cache_stft_0, first_chunk], dim=-1),
+            **stft_cfg, window=win, return_complex=True,
+        )
+        cache_out = first_chunk[:, -3 * hop_size:]
+        return torch.view_as_real(stft_x), cache_out
+
+    def stft_mid_spec(pad_mix, frame_idx, cache_stft_0):
+        start_i = (frame_idx * 3 + 4) * hop_size
+        end_i = (frame_idx * 3 + 7) * hop_size
+        chunk = pad_mix[..., start_i:end_i]
+        stft_x = torch.stft(
+            torch.cat([cache_stft_0, chunk], dim=-1),
+            **stft_cfg, window=win, return_complex=True,
+        )
+        return torch.view_as_real(stft_x), chunk[:, -3 * hop_size:]
+
+    def pad_segment(mix):
+        padding = hop_size - mix.shape[-1] % hop_size
+        if (mix.shape[-1] + padding) // hop_size % 2 == 0:
+            padding += hop_size
+        t_frames = 1 + (mix.shape[-1] + padding) // hop_size
+        if t_frames % 3 != 0:
+            padding += ((3 - t_frames % 3) % 3) * hop_size
+        return F.pad(mix, (0, padding))
+
+    records = []
+    n_ok = 0
+    for file_idx, audio_path in enumerate(audio_paths):
+        try:
+            audio_data, sample_rate = load_audio(audio_path)
+            mix = torch.from_numpy(np.asarray(audio_data.T, np.float32))
+            mix = convert_audio(mix, sample_rate, sample_rate, 2)
+
+            if args.start_sec < 0:
+                max_start = mix.shape[-1] - min_raw
+                if max_start <= 0:
+                    print(f"[generate_cache_state] skip (too short): {audio_path}")
+                    continue
+                start = int(rng.integers(0, max_start))
+            else:
+                start = max(0, int(args.start_sec * sample_rate))
+                if start + min_raw > mix.shape[-1]:
+                    print(f"[generate_cache_state] skip (segment OOB): {audio_path}")
+                    continue
+
+            mix = mix[..., start:start + min_raw]
+            pad_mix = pad_segment(mix)
+
+            # --- first: save inputs, ORT run -> mid initial state ---
+            first_spec_t, cache_stft_0 = stft_first_spec(pad_mix)
+            first_spec = first_spec_t.numpy().astype(np.float32)
+            d0 = spec_in_shape[0]
+            first_input_save[n_ok * d0:(n_ok + 1) * d0] = first_spec
+
+            feeds = {FIRST_INPUT_NAMES[0]: first_spec}
+            for name, tensor in zip(CACHE_NAMES, zero_caches):
+                feeds[name] = tensor
+            ort_state = first_sess.run(None, feeds)
+
+            # --- mid: state[0] comes ONLY from first output (per file) ---
+            for j in range(mid_frames):
+                spec_t, cache_stft_0 = stft_mid_spec(pad_mix, j, cache_stft_0)
+                spec_in = spec_t.numpy().astype(np.float32)
+                flat_i = n_ok * mid_frames + j
+
+                d0 = spec_in_shape[0]
+                mid_input_save[flat_i * d0:(flat_i + 1) * d0] = spec_in
+                for name, val in zip(STATE_NAMES, ort_state):
+                    d0 = cache_shapes[name][0]
+                    mid_state_saves[name][flat_i * d0:(flat_i + 1) * d0] = val
+
+                feeds = {MID_INPUT_NAMES[0]: spec_in}
+                for name, val in zip(STATE_NAMES, ort_state):
+                    feeds[name] = val
+                ort_out = mid_sess.run(None, feeds)
+                chunk_output = ort_out[0]
+                ort_state = ort_out[1:]
+
+                d0 = chunk_out_shape[0]
+                mid_output_save[flat_i * d0:(flat_i + 1) * d0] = chunk_output
+
+            records.append({
+                "index": n_ok,
+                "path": audio_path,
+                "start_sample": start,
+                "start_sec": start / sample_rate,
+            })
+            n_ok += 1
+            if n_ok % 100 == 0 or n_ok == n_files:
+                print(f"[generate_cache_state] processed {n_ok}/{n_files} files")
+        except Exception as exc:
+            print(f"[generate_cache_state] skip (error): {audio_path}: {exc}")
+
+    if n_ok == 0:
+        raise RuntimeError("No valid audio files processed")
+
+    # trim pre-allocated buffers to actual count
+    d0 = spec_in_shape[0]
+    first_input_save = first_input_save[:n_ok * d0]
+    first_cache_saves = {
+        name: arr[:n_ok * cache_shapes[name][0]] for name, arr in first_cache_saves.items()
+    }
+    mid_input_save = mid_input_save[:n_ok * mid_frames * d0]
+    mid_output_save = mid_output_save[:n_ok * mid_frames * chunk_out_shape[0]]
+    mid_state_saves = {
+        name: arr[:n_ok * mid_frames * cache_shapes[name][0]]
+        for name, arr in mid_state_saves.items()
+    }
+
+    np.save(out_dir / "first_input.npy", first_input_save)
+    for name, arr in first_cache_saves.items():
         np.save(out_dir / f"first_{name}.npy", arr)
-
-    feeds = {FIRST_INPUT_NAMES[0]: first_spec}
-    for name, tensor in zip(CACHE_NAMES, zero_caches):
-        feeds[name] = tensor
-    ort_state = first_sess.run(None, feeds)
-
-    for i in range(mid_frames):
-        start_i = (i * 3 + 4) * hop_size
-        end_i = (i * 3 + 7) * hop_size
-        x, cache_stft_0 = stft_chunk(pad_mix[..., start_i:end_i], cache_stft_0)
-        spec_in = x.numpy().astype(np.float32)
-
-        d0 = spec_in_shape[0]
-        mid_input_save[i * d0:(i + 1) * d0] = spec_in
-        for name, val in zip(STATE_NAMES, ort_state):
-            d0 = cache_shapes[name][0]
-            mid_state_saves[name][i * d0:(i + 1) * d0] = val
-
-        feeds = {MID_INPUT_NAMES[0]: spec_in}
-        for name, val in zip(STATE_NAMES, ort_state):
-            feeds[name] = val
-        ort_out = mid_sess.run(None, feeds)
-        chunk_output = ort_out[0]
-        ort_state = ort_out[1:]
-
-        d0 = chunk_out_shape[0]
-        mid_output_save[i * d0:(i + 1) * d0] = chunk_output
-
     np.save(out_dir / "mid_input.npy", mid_input_save)
     for name, arr in mid_state_saves.items():
         np.save(out_dir / f"mid_{name}.npy", arr)
     np.save(out_dir / "mid_output.npy", mid_output_save)
 
     meta = {
-        "input_audio": str(args.input_dir),
-        "sample_rate": sample_rate,
-        "start_sample": start,
-        "start_sec": start / sample_rate,
+        "num_files": n_ok,
         "mid_frames": mid_frames,
         "quan_seed": args.quan_seed,
+        "start_sec_mode": "random" if args.start_sec < 0 else args.start_sec,
         "spec_in_shape": list(spec_in_shape),
         "chunk_out_shape": list(chunk_out_shape),
+        "files": records,
     }
     with open(out_dir / "meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+        json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    print(f"[generate_cache_state] saved first + {mid_frames} mid frames to {out_dir}")
-    print(f"  first_input.npy {first_spec.shape}")
-    for name in CACHE_NAMES:
-        print(f"  first_{name}.npy {cache_shapes[name]}")
+    print(f"[generate_cache_state] saved {n_ok} files to {out_dir}")
+    print(f"  first_input.npy {first_input_save.shape}")
     print(f"  mid_input.npy {mid_input_save.shape}")
-    for name in STATE_NAMES:
-        print(f"  mid_{name}.npy {mid_state_saves[name].shape}")
     print(f"  mid_output.npy {mid_output_save.shape}")
-    print(f"  meta.json start_sec={meta['start_sec']:.3f}")
+    print(f"  total mid samples = {n_ok * mid_frames}")
 
 
 if __name__ == '__main__':
