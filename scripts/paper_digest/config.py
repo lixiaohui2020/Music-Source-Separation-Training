@@ -7,15 +7,30 @@ from pathlib import Path
 import yaml
 
 DEFAULT_SEARCH_QUERIES = [
-    'all:"vocal separation" OR all:"vocals separation"',
-    'all:"accompaniment separation"',
-    'all:"music source separation" AND all:vocals',
-    'all:"singing voice separation"',
-    'all:"stem separation" AND all:vocals',
-    'ti:"source separation" AND (ti:vocal OR ti:vocals OR ti:singing)',
+    # 降噪 / 增强
+    'all:"speech enhancement" OR all:"audio denoising" OR all:"speech denoising"',
+    'all:"noise suppression" OR all:"audio restoration"',
+    # 去回声 / 去混响
+    'all:"echo cancellation" OR all:dereverberation OR all:"acoustic echo"',
+    # 源分离 / 人声分离
+    'all:"source separation" OR all:"vocal separation" OR all:"music source separation"',
+    'all:"singing voice separation" OR all:"stem separation"',
+    # 语音识别 / 转录
+    'all:"speech recognition" OR all:"automatic speech recognition" OR all:ASR',
+    'all:"speech transcription" OR all:"speech-to-text" OR all:whisper',
+    # 语音交互 / 对话
+    'all:"spoken dialogue" OR all:"voice interaction" OR all:"spoken language model"',
+    'all:"speech understanding" OR all:"audio language model"',
+    # 语音合成 / 生成
+    'all:"text-to-speech" OR all:"speech synthesis" OR all:"neural vocoder"',
+    'all:"audio generation" OR all:"sound generation" OR all:"music generation"',
+    # 说话人 / 声纹
+    'all:"speaker diarization" OR all:"voice conversion" OR all:"speaker verification"',
+    # 音频基础模型
+    'all:"audio large language model" OR all:"audio LLM" OR all:"speech foundation model"',
 ]
 
-DEFAULT_CATEGORIES = ["cs.SD", "eess.AS", "cs.LG"]
+DEFAULT_CATEGORIES = ["cs.SD", "eess.AS", "cs.CL", "cs.LG", "cs.AI"]
 
 
 @dataclass
@@ -27,12 +42,13 @@ class PaperDigestConfig:
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_use_tls: bool = True
-    sender_name: str = "Vocal Separation Paper Digest"
+    sender_name: str = "AI Audio Paper Digest"
+    digest_title: str = "AI 音频 · 每日论文推送"
     graph_client_id: str = ""
     graph_authority: str = "https://login.microsoftonline.com/consumers"
     timezone: str = "Asia/Shanghai"
     schedule_hour: int = 8
-    max_papers_per_day: int = 10
+    max_papers_per_day: int = 15
     lookback_days: int = 7
     initial_lookback_days: int = 30
     search_queries: list[str] = field(default_factory=lambda: list(DEFAULT_SEARCH_QUERIES))
@@ -91,6 +107,7 @@ def load_config(config_path: str | Path | None = None) -> PaperDigestConfig:
     cfg.smtp_password = _env("PAPER_DIGEST_SMTP_PASSWORD", email_cfg.get("smtp_password", cfg.smtp_password))
     cfg.smtp_use_tls = bool(email_cfg.get("smtp_use_tls", cfg.smtp_use_tls))
     cfg.sender_name = email_cfg.get("sender_name", cfg.sender_name)
+    cfg.digest_title = email_cfg.get("digest_title", cfg.digest_title)
 
     graph_cfg = email_cfg.get("graph", {})
     cfg.graph_client_id = _env("PAPER_DIGEST_GRAPH_CLIENT_ID", graph_cfg.get("client_id", cfg.graph_client_id))

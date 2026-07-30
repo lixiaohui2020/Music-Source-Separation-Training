@@ -1,39 +1,46 @@
-# 人声/伴奏分离 · 每日论文推送配置
-# 复制为 paper_digest.yaml 并填写你的邮箱信息：
+# AI 音频 · 每日论文推送配置
+# 复制为 paper_digest.yaml 并填写邮箱信息：
 #   cp configs/paper_digest.example.yaml configs/paper_digest.yaml
 
 email:
-  recipient: "your-email@example.com"
-  auth_method: smtp        # smtp（Gmail/QQ/163）| graph（Outlook 个人邮箱）
-  smtp_host: "smtp.gmail.com"          # Gmail: smtp.gmail.com | QQ: smtp.qq.com | Outlook: 需 graph 模式
+  recipient: "lixiaohui@allwinnertech.com"
+  auth_method: smtp
+  smtp_host: "smtp.qq.com"
   smtp_port: 587
-  smtp_user: "your-email@example.com"
-  smtp_password: "your-app-password"   # 请使用应用专用密码，勿提交到 git
+  smtp_user: "1055864643@qq.com"
+  smtp_password: ""   # QQ 授权码，或设置环境变量 PAPER_DIGEST_SMTP_PASSWORD
   smtp_use_tls: true
-  sender_name: "Vocal Separation Paper Digest"
-  graph:
-    client_id: ""          # Azure 应用客户端 ID（Outlook 个人邮箱必填）
-    authority: "https://login.microsoftonline.com/consumers"
+  sender_name: "AI Audio Paper Digest"
+  digest_title: "AI 音频 · 每日论文推送"
 
 schedule:
-  timezone: "Asia/Shanghai"   # 每天 8:00 按此时区发送
+  timezone: "Asia/Shanghai"
   hour: 8
 
 search:
-  max_papers_per_day: 10
-  lookback_days: 7          # 日常回溯天数（仅推送未发送过的新论文）
-  initial_lookback_days: 30 # 首次运行回溯天数
+  max_papers_per_day: 15
+  lookback_days: 7
+  initial_lookback_days: 30
   queries:
-    - 'all:"vocal separation" OR all:"vocals separation"'
-    - 'all:"accompaniment separation"'
-    - 'all:"music source separation" AND all:vocals'
-    - 'all:"singing voice separation"'
-    - 'all:"stem separation" AND all:vocals'
-    - 'ti:"source separation" AND (ti:vocal OR ti:vocals OR ti:singing)'
+    - 'all:"speech enhancement" OR all:"audio denoising" OR all:"speech denoising"'
+    - 'all:"noise suppression" OR all:"audio restoration"'
+    - 'all:"echo cancellation" OR all:dereverberation OR all:"acoustic echo"'
+    - 'all:"source separation" OR all:"vocal separation" OR all:"music source separation"'
+    - 'all:"singing voice separation" OR all:"stem separation"'
+    - 'all:"speech recognition" OR all:"automatic speech recognition" OR all:ASR'
+    - 'all:"speech transcription" OR all:"speech-to-text" OR all:whisper'
+    - 'all:"spoken dialogue" OR all:"voice interaction" OR all:"spoken language model"'
+    - 'all:"speech understanding" OR all:"audio language model"'
+    - 'all:"text-to-speech" OR all:"speech synthesis" OR all:"neural vocoder"'
+    - 'all:"audio generation" OR all:"sound generation" OR all:"music generation"'
+    - 'all:"speaker diarization" OR all:"voice conversion" OR all:"speaker verification"'
+    - 'all:"audio large language model" OR all:"audio LLM" OR all:"speech foundation model"'
   categories:
     - cs.SD
     - eess.AS
+    - cs.CL
     - cs.LG
+    - cs.AI
 
 paths:
   data_dir: data/paper_digest

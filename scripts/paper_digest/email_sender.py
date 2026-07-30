@@ -27,7 +27,7 @@ def build_html_email(
     date_str = now.strftime("%Y年%m月%d日")
 
     if not papers:
-        body = "<p>今日暂无新的人声/伴奏分离相关论文。</p>"
+        body = "<p>今日暂无新的 AI 音频相关论文。</p>"
     else:
         sections = []
         for index, (paper, summary, github_links) in enumerate(papers, start=1):
@@ -59,8 +59,8 @@ def build_html_email(
     return f"""
     <html>
       <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111;max-width:760px;">
-        <h1 style="font-size:22px;">🎵 人声/伴奏分离 · 每日论文推送</h1>
-        <p style="color:#666;">{date_str} · 共 {len(papers)} 篇新论文</p>
+        <h1 style="font-size:22px;">🎧 {html.escape(cfg.digest_title)}</h1>
+        <p style="color:#666;">{date_str} · 共 {len(papers)} 篇新论文 · 覆盖降噪、去回声、人声分离、语音转录、语音交互等</p>
         {body}
         <hr style="border:none;border-top:1px solid #eee;margin:24px 0;" />
         <p style="color:#999;font-size:12px;">由 Music Source Separation Training 项目的 paper_digest 自动推送</p>
@@ -77,7 +77,7 @@ def send_digest_email(
         raise ValueError("未配置收件邮箱 (PAPER_DIGEST_RECIPIENT 或 configs/paper_digest.yaml)")
 
     now = datetime.now(ZoneInfo(cfg.timezone))
-    subject = f"【论文推送】人声/伴奏分离 · {now.strftime('%Y-%m-%d')} ({len(papers)} 篇)"
+    subject = f"【论文推送】AI 音频 · {now.strftime('%Y-%m-%d')} ({len(papers)} 篇)"
     html_content = build_html_email(papers, cfg)
 
     if cfg.auth_method == "graph":

@@ -81,7 +81,7 @@ def run_digest(*, dry_run: bool = False, force: bool = False, config_path: str |
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="人声/伴奏分离每日论文推送")
+    parser = argparse.ArgumentParser(description="AI 音频领域每日论文推送")
     parser.add_argument("--dry-run", action="store_true", help="仅生成 HTML 预览，不发送邮件")
     parser.add_argument("--force", action="store_true", help="忽略去重记录，重新推送")
     parser.add_argument("--config", type=str, default=None, help="配置文件路径")

@@ -11,6 +11,18 @@ _CONTRIBUTION_PATTERNS = [
     r"(?:our\s+)?(?:main\s+)?contributions?\s+(?:are|include)\s+(.{20,280}?)(?:\.|$)",
 ]
 
+_TOPIC_RULES: list[tuple[str, list[str]]] = [
+    ("降噪增强", [r"denois", r"noise suppression", r"speech enhancement", r"audio restoration"]),
+    ("去回声", [r"echo cancell", r"dereverb", r"acoustic echo"]),
+    ("人声分离", [r"source separation", r"vocal separation", r"stem separation", r"singing voice"]),
+    ("语音转录", [r"speech recognition", r"automatic speech recognition", r"\basr\b", r"speech-to-text", r"transcription", r"whisper"]),
+    ("语音交互", [r"spoken dialogue", r"voice interaction", r"spoken language", r"speech understanding"]),
+    ("语音合成", [r"text-to-speech", r"speech synthesis", r"vocoder", r"voice cloning"]),
+    ("音频生成", [r"audio generation", r"sound generation", r"music generation", r"audio lm"]),
+    ("说话人", [r"speaker diarization", r"voice conversion", r"speaker verification", r"speaker recognition"]),
+    ("音频大模型", [r"audio llm", r"audio language model", r"speech foundation", r"multimodal audio"]),
+]
+
 
 def _first_sentences(text: str, count: int = 2) -> str:
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
@@ -29,13 +41,27 @@ def _extract_contribution(abstract: str) -> str | None:
     return None
 
 
+def detect_topics(paper: Paper, max_topics: int = 3) -> list[str]:
+    text = f"{paper.title} {paper.abstract}".lower()
+    matched: list[str] = []
+    for label, patterns in _TOPIC_RULES:
+        if any(re.search(p, text, flags=re.IGNORECASE) for p in patterns):
+            matched.append(label)
+        if len(matched) >= max_topics:
+            break
+    return matched or ["AI 音频"]
+
+
 def summarize_paper(paper: Paper) -> str:
     """Build a concise Chinese-friendly core introduction from the abstract."""
     contribution = _extract_contribution(paper.abstract)
     intro = contribution or _first_sentences(paper.abstract, 2)
 
+    topics = detect_topics(paper)
+    topic_note = f" 领域标签：{' / '.join(topics)}。"
+
     metrics_match = re.search(
-        r"(sdr|si-sdr|pesq|stoi)[^\n.]{0,80}",
+        r"(sdr|si-sdr|pesq|stoi|wer|bleu)[^\n.]{0,80}",
         paper.abstract,
         flags=re.IGNORECASE,
     )
@@ -43,13 +69,4 @@ def summarize_paper(paper: Paper) -> str:
     if metrics_match:
         metric_note = f" 实验指标提及：{metrics_match.group(0).strip()}。"
 
-    stems_match = re.search(
-        r"\b(vocals?|accompaniment|instrumental|karaoke|singing voice|music source separation)\b[^.]{0,60}",
-        paper.abstract,
-        flags=re.IGNORECASE,
-    )
-    focus_note = ""
-    if stems_match:
-        focus_note = f" 关注方向：{stems_match.group(0).strip()}。"
-
-    return f"{intro}{focus_note}{metric_note}".strip()
+    return f"{intro}{topic_note}{metric_note}".strip()
