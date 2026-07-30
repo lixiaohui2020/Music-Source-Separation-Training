@@ -53,20 +53,7 @@ def detect_topics(paper: Paper, max_topics: int = 3) -> list[str]:
 
 
 def summarize_paper(paper: Paper) -> str:
-    """Build a concise Chinese-friendly core introduction from the abstract."""
-    contribution = _extract_contribution(paper.abstract)
-    intro = contribution or _first_sentences(paper.abstract, 2)
+    """Backward-compatible brief summary string."""
+    from scripts.paper_digest.paper_analyzer import analyze_paper
 
-    topics = detect_topics(paper)
-    topic_note = f" 领域标签：{' / '.join(topics)}。"
-
-    metrics_match = re.search(
-        r"(sdr|si-sdr|pesq|stoi|wer|bleu)[^\n.]{0,80}",
-        paper.abstract,
-        flags=re.IGNORECASE,
-    )
-    metric_note = ""
-    if metrics_match:
-        metric_note = f" 实验指标提及：{metrics_match.group(0).strip()}。"
-
-    return f"{intro}{topic_note}{metric_note}".strip()
+    return analyze_paper(paper).brief_summary

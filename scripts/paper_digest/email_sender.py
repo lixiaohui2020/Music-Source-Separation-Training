@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 from scripts.paper_digest.arxiv_client import Paper
 from scripts.paper_digest.config import PaperDigestConfig
+from scripts.paper_digest.email_renderer import render_pipeline_flowchart, render_results_list
+from scripts.paper_digest.paper_analyzer import PaperAnalysis
 
 
 def _format_authors(authors: list[str], max_count: int = 5) -> str:
@@ -19,8 +21,20 @@ def _format_authors(authors: list[str], max_count: int = 5) -> str:
     return ", ".join(authors[:max_count]) + f" 等 {len(authors)} 人"
 
 
+def _render_topic_tags(topics: list[str]) -> str:
+    if not topics:
+        return ""
+    tags = "".join(
+        f'<span style="display:inline-block;margin:2px 4px 2px 0;padding:2px 8px;'
+        f'background:#f3f4f6;border-radius:12px;font-size:12px;color:#4b5563;">'
+        f"{html.escape(t)}</span>"
+        for t in topics
+    )
+    return f'<p style="margin:6px 0;">{tags}</p>'
+
+
 def build_html_email(
-    papers: list[tuple[Paper, str, list[str]]],
+    papers: list[tuple[Paper, PaperAnalysis, list[str]]],
     cfg: PaperDigestConfig,
 ) -> str:
     now = datetime.now(ZoneInfo(cfg.timezone))
@@ -30,7 +44,7 @@ def build_html_email(
         body = "<p>今日暂无新的 AI 音频相关论文。</p>"
     else:
         sections = []
-        for index, (paper, summary, github_links) in enumerate(papers, start=1):
+        for index, (paper, analysis, github_links) in enumerate(papers, start=1):
             gh_html = ""
             if github_links:
                 gh_items = "".join(
@@ -41,15 +55,39 @@ def build_html_email(
             else:
                 gh_html = "<p><strong>参考 GitHub：</strong>暂未找到公开仓库</p>"
 
+            flowchart_html = render_pipeline_flowchart(analysis.pipeline_steps)
+            results_html = render_results_list(analysis.experiment_results)
+
             sections.append(
                 f"""
-                <div style="margin-bottom:24px;padding:16px;border:1px solid #e5e7eb;border-radius:8px;">
+                <div style="margin-bottom:28px;padding:18px;border:1px solid #e5e7eb;border-radius:10px;">
                   <h2 style="margin:0 0 8px;font-size:18px;">{index}. {html.escape(paper.title)}</h2>
+                  {_render_topic_tags(analysis.topics)}
                   <p style="margin:4px 0;color:#555;">作者：{html.escape(_format_authors(paper.authors))}</p>
                   <p style="margin:4px 0;color:#555;">发布：{paper.published.astimezone(ZoneInfo(cfg.timezone)).strftime('%Y-%m-%d')}</p>
                   <p style="margin:8px 0;"><a href="{html.escape(paper.arxiv_url)}">arXiv 论文页</a> ·
                   <a href="{html.escape(paper.pdf_url)}">PDF</a></p>
-                  <p style="margin:8px 0;"><strong>核心介绍：</strong>{html.escape(summary)}</p>
+
+                  <div style="margin:12px 0;padding:12px;background:#f9fafb;border-radius:8px;">
+                    <p style="margin:0 0 6px;font-weight:600;color:#111;">📌 核心介绍</p>
+                    <p style="margin:0;color:#333;line-height:1.6;">{html.escape(analysis.brief_summary)}</p>
+                  </div>
+
+                  <div style="margin:12px 0;padding:12px;background:#fffbeb;border-left:4px solid #f59e0b;border-radius:4px;">
+                    <p style="margin:0 0 6px;font-weight:600;color:#111;">💡 核心思路</p>
+                    <p style="margin:0;color:#333;line-height:1.6;">{html.escape(analysis.core_idea)}</p>
+                  </div>
+
+                  <div style="margin:12px 0;padding:12px;background:#f0fdf4;border-radius:8px;">
+                    <p style="margin:0 0 6px;font-weight:600;color:#111;">🔀 方法流程图</p>
+                    {flowchart_html}
+                  </div>
+
+                  <div style="margin:12px 0;padding:12px;background:#fef2f2;border-radius:8px;">
+                    <p style="margin:0 0 6px;font-weight:600;color:#111;">📊 核心实验结果</p>
+                    {results_html}
+                  </div>
+
                   {gh_html}
                 </div>
                 """
@@ -58,19 +96,19 @@ def build_html_email(
 
     return f"""
     <html>
-      <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111;max-width:760px;">
+      <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111;max-width:820px;">
         <h1 style="font-size:22px;">🎧 {html.escape(cfg.digest_title)}</h1>
-        <p style="color:#666;">{date_str} · 共 {len(papers)} 篇新论文 · 覆盖降噪、去回声、人声分离、语音转录、语音交互等</p>
+        <p style="color:#666;">{date_str} · 共 {len(papers)} 篇新论文 · 含核心思路、流程图、实验结果</p>
         {body}
         <hr style="border:none;border-top:1px solid #eee;margin:24px 0;" />
-        <p style="color:#999;font-size:12px;">由 Music Source Separation Training 项目的 paper_digest 自动推送</p>
+        <p style="color:#999;font-size:12px;">由 paper_digest 自动推送 · 流程图与实验结果从摘要自动提取</p>
       </body>
     </html>
     """
 
 
 def send_digest_email(
-    papers: list[tuple[Paper, str, list[str]]],
+    papers: list[tuple[Paper, PaperAnalysis, list[str]]],
     cfg: PaperDigestConfig,
 ) -> None:
     if not cfg.recipient:

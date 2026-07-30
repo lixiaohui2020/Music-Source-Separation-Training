@@ -10,7 +10,7 @@ from scripts.paper_digest.config import load_config
 from scripts.paper_digest.email_sender import build_html_email, send_digest_email
 from scripts.paper_digest.github_finder import find_github_links
 from scripts.paper_digest.storage import SentPaperStore
-from scripts.paper_digest.summarizer import summarize_paper
+from scripts.paper_digest.paper_analyzer import analyze_paper
 
 
 def setup_logging(log_path: Path) -> None:
@@ -54,9 +54,9 @@ def run_digest(*, dry_run: bool = False, force: bool = False, config_path: str |
 
     digest_items: list[tuple] = []
     for paper in selected:
-        summary = summarize_paper(paper)
+        analysis = analyze_paper(paper)
         github_links = find_github_links(paper)
-        digest_items.append((paper, summary, github_links))
+        digest_items.append((paper, analysis, github_links))
         logging.info("选中: %s (%s)", paper.title, paper.arxiv_id)
 
     if dry_run:
