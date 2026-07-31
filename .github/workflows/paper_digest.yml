@@ -33,7 +33,7 @@ jobs:
           key: paper-digest-sent-${{ github.repository }}
 
       - name: Install dependencies
-        run: pip install PyYAML requests
+        run: pip install PyYAML requests pymupdf Pillow
 
       - name: Send daily AI audio paper digest
         env:

@@ -25,9 +25,17 @@ def setup_logging(log_path: Path) -> None:
     )
 
 
-def run_digest(*, dry_run: bool = False, force: bool = False, config_path: str | None = None) -> int:
+def run_digest(
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    config_path: str | None = None,
+    max_papers: int | None = None,
+) -> int:
     cfg = load_config(config_path)
     setup_logging(cfg.log_path)
+    if max_papers is not None:
+        cfg.max_papers_per_day = max_papers
 
     logging.info("开始抓取 arXiv 论文...")
     store = SentPaperStore(cfg.sent_papers_path)
@@ -54,10 +62,17 @@ def run_digest(*, dry_run: bool = False, force: bool = False, config_path: str |
 
     digest_items: list[tuple] = []
     for paper in selected:
-        analysis = analyze_paper(paper)
+        analysis = analyze_paper(paper, cache_dir=cfg.data_dir / "pdf_cache")
         github_links = find_github_links(paper)
         digest_items.append((paper, analysis, github_links))
-        logging.info("选中: %s (%s)", paper.title, paper.arxiv_id)
+        logging.info(
+            "选中: %s (%s) | 架构图=%d 结果图=%d 表格=%d",
+            paper.title,
+            paper.arxiv_id,
+            len(analysis.architecture_figures),
+            len(analysis.result_figures),
+            len(analysis.result_tables),
+        )
 
     if dry_run:
         html_preview = build_html_email(digest_items, cfg)
@@ -85,10 +100,16 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="仅生成 HTML 预览，不发送邮件")
     parser.add_argument("--force", action="store_true", help="忽略去重记录，重新推送")
     parser.add_argument("--config", type=str, default=None, help="配置文件路径")
+    parser.add_argument("--max-papers", type=int, default=None, help="覆盖每日论文上限")
     args = parser.parse_args()
 
     try:
-        code = run_digest(dry_run=args.dry_run, force=args.force, config_path=args.config)
+        code = run_digest(
+            dry_run=args.dry_run,
+            force=args.force,
+            config_path=args.config,
+            max_papers=args.max_papers,
+        )
     except Exception as exc:
         logging.exception("推送失败: %s", exc)
         sys.exit(1)

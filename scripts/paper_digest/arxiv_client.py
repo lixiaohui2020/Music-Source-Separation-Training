@@ -102,8 +102,23 @@ def fetch_recent_papers(
         "sortOrder": "descending",
     }
 
-    response = requests.get(ARXIV_API, params=params, timeout=60)
-    response.raise_for_status()
+    last_error: Exception | None = None
+    response = None
+    for attempt in range(5):
+        try:
+            response = requests.get(ARXIV_API, params=params, timeout=60)
+            if response.status_code == 429:
+                wait = 8 * (attempt + 1)
+                time.sleep(wait)
+                last_error = requests.HTTPError(f"429 from arXiv (attempt {attempt + 1})")
+                continue
+            response.raise_for_status()
+            break
+        except requests.RequestException as exc:
+            last_error = exc
+            time.sleep(5 * (attempt + 1))
+    else:
+        raise last_error or RuntimeError("arXiv API request failed")
 
     root = ET.fromstring(response.content)
     papers: list[Paper] = []

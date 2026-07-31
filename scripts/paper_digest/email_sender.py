@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.paper_digest.arxiv_client import Paper
 from scripts.paper_digest.config import PaperDigestConfig
-from scripts.paper_digest.email_renderer import render_pipeline_flowchart, render_results_list
+from scripts.paper_digest.email_renderer import render_analysis_sections
 from scripts.paper_digest.paper_analyzer import PaperAnalysis
 
 
@@ -31,6 +31,10 @@ def _render_topic_tags(topics: list[str]) -> str:
         for t in topics
     )
     return f'<p style="margin:6px 0;">{tags}</p>'
+
+
+def _format_multiline(text: str) -> str:
+    return "<br/>".join(html.escape(line) for line in text.split("\n") if line.strip())
 
 
 def build_html_email(
@@ -55,8 +59,16 @@ def build_html_email(
             else:
                 gh_html = "<p><strong>参考 GitHub：</strong>暂未找到公开仓库</p>"
 
-            flowchart_html = render_pipeline_flowchart(analysis.pipeline_steps)
-            results_html = render_results_list(analysis.experiment_results)
+            rendered = render_analysis_sections(analysis)
+            result_body = (
+                rendered["result_tables_html"]
+                + rendered["result_figures_html"]
+                + rendered["highlights_html"]
+            )
+            if not result_body.strip():
+                result_body = (
+                    "<p style='color:#888;'>未从 PDF 提取到实验表格/结果图，请查看原文 PDF。</p>"
+                )
 
             sections.append(
                 f"""
@@ -70,22 +82,22 @@ def build_html_email(
 
                   <div style="margin:12px 0;padding:12px;background:#f9fafb;border-radius:8px;">
                     <p style="margin:0 0 6px;font-weight:600;color:#111;">📌 核心介绍</p>
-                    <p style="margin:0;color:#333;line-height:1.6;">{html.escape(analysis.brief_summary)}</p>
+                    <p style="margin:0;color:#333;line-height:1.65;">{html.escape(analysis.brief_summary)}</p>
                   </div>
 
                   <div style="margin:12px 0;padding:12px;background:#fffbeb;border-left:4px solid #f59e0b;border-radius:4px;">
                     <p style="margin:0 0 6px;font-weight:600;color:#111;">💡 核心思路</p>
-                    <p style="margin:0;color:#333;line-height:1.6;">{html.escape(analysis.core_idea)}</p>
+                    <p style="margin:0;color:#333;line-height:1.65;">{_format_multiline(analysis.core_idea)}</p>
                   </div>
 
                   <div style="margin:12px 0;padding:12px;background:#f0fdf4;border-radius:8px;">
-                    <p style="margin:0 0 6px;font-weight:600;color:#111;">🔀 方法流程图</p>
-                    {flowchart_html}
+                    <p style="margin:0 0 6px;font-weight:600;color:#111;">🔀 论文流程图 / 架构图（作者原图）</p>
+                    {rendered["architecture_html"]}
                   </div>
 
                   <div style="margin:12px 0;padding:12px;background:#fef2f2;border-radius:8px;">
-                    <p style="margin:0 0 6px;font-weight:600;color:#111;">📊 核心实验结果</p>
-                    {results_html}
+                    <p style="margin:0 0 6px;font-weight:600;color:#111;">📊 核心实验结果（论文原表/原图）</p>
+                    {result_body}
                   </div>
 
                   {gh_html}
@@ -96,12 +108,12 @@ def build_html_email(
 
     return f"""
     <html>
-      <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111;max-width:820px;">
+      <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111;max-width:860px;">
         <h1 style="font-size:22px;">🎧 {html.escape(cfg.digest_title)}</h1>
-        <p style="color:#666;">{date_str} · 共 {len(papers)} 篇新论文 · 含核心思路、流程图、实验结果</p>
+        <p style="color:#666;">{date_str} · 共 {len(papers)} 篇新论文 · 含作者原图与实验结果</p>
         {body}
         <hr style="border:none;border-top:1px solid #eee;margin:24px 0;" />
-        <p style="color:#999;font-size:12px;">由 paper_digest 自动推送 · 流程图与实验结果从摘要自动提取</p>
+        <p style="color:#999;font-size:12px;">流程图与实验结果提取自 arXiv PDF 原文；若个别论文未嵌入成功请点开 PDF 查看</p>
       </body>
     </html>
     """
