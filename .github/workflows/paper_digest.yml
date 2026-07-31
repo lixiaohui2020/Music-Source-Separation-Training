@@ -44,4 +44,5 @@ jobs:
           PAPER_DIGEST_SMTP_USER: 1055864643@qq.com
           PAPER_DIGEST_SMTP_PASSWORD: ${{ secrets.PAPER_DIGEST_SMTP_PASSWORD }}
           PAPER_DIGEST_TIMEZONE: Asia/Shanghai
+          PAPER_DIGEST_MAX_PAPERS: "15"
         run: python -m scripts.paper_digest.main

@@ -116,7 +116,9 @@ def load_config(config_path: str | Path | None = None) -> PaperDigestConfig:
     cfg.timezone = _env("PAPER_DIGEST_TIMEZONE", schedule_cfg.get("timezone", cfg.timezone))
     cfg.schedule_hour = int(schedule_cfg.get("hour", cfg.schedule_hour))
 
-    cfg.max_papers_per_day = int(search_cfg.get("max_papers_per_day", cfg.max_papers_per_day))
+    cfg.max_papers_per_day = int(
+        _env("PAPER_DIGEST_MAX_PAPERS", str(search_cfg.get("max_papers_per_day", cfg.max_papers_per_day)))
+    )
     cfg.lookback_days = int(search_cfg.get("lookback_days", cfg.lookback_days))
     cfg.initial_lookback_days = int(search_cfg.get("initial_lookback_days", cfg.initial_lookback_days))
     if search_cfg.get("queries"):

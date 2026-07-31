@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import re
 from dataclasses import dataclass, field
@@ -144,6 +145,22 @@ def _find_caption_blocks(page: fitz.Page, kind: str = "figure") -> list[tuple[fi
     return captions
 
 
+def _compress_png(image_bytes: bytes, max_width: int = 900) -> bytes:
+    """Downscale large screenshots so 10–15 papers fit in one email."""
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        if image.width > max_width:
+            ratio = max_width / float(image.width)
+            image = image.resize((max_width, max(1, int(image.height * ratio))), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=82, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return image_bytes
+
+
 def _render_region_above_caption(
     page: fitz.Page,
     caption_rect: fitz.Rect,
@@ -151,7 +168,7 @@ def _render_region_above_caption(
     kind: str,
     upward: float = 340,
 ) -> ExtractedFigure | None:
-    """Render region above caption as PNG to capture vector figures/tables."""
+    """Render region above caption as image to capture vector figures/tables."""
     page_rect = page.rect
     top = max(page_rect.y0 + 15, caption_rect.y0 - upward)
     if caption_rect.y0 > page_rect.height * 0.45:
@@ -161,16 +178,16 @@ def _render_region_above_caption(
     if clip.height < 50 or clip.width < 80:
         return None
     try:
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), clip=clip, alpha=False)
-        image_bytes = pix.tobytes("png")
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), clip=clip, alpha=False)
+        image_bytes = _compress_png(pix.tobytes("png"))
     except Exception:
         return None
-    if len(image_bytes) < 4000:
+    if len(image_bytes) < 2500:
         return None
     return ExtractedFigure(
         caption=caption,
         image_bytes=image_bytes,
-        mime_type="image/png",
+        mime_type="image/jpeg",
         kind=kind,
         page=page.number + 1,
     )
@@ -223,14 +240,14 @@ def extract_from_pdf(pdf_path: Path) -> PdfExtract:
         table_images = _extract_table_images(doc)
 
         for fig in figures:
-            if fig.kind == "architecture" and len(extract.architecture_figures) < 2:
+            if fig.kind == "architecture" and len(extract.architecture_figures) < 1:
                 extract.architecture_figures.append(fig)
-            elif fig.kind == "result" and len(extract.result_figures) < 2:
+            elif fig.kind == "result" and len(extract.result_figures) < 1:
                 extract.result_figures.append(fig)
 
-        # Prefer rendered original tables as experimental results
+        # Prefer rendered original tables as experimental results (up to 2)
         for fig in reversed(table_images):
-            if len(extract.result_figures) < 3:
+            if len(extract.result_figures) < 2:
                 extract.result_figures.insert(0, fig)
 
         if not extract.architecture_figures:
