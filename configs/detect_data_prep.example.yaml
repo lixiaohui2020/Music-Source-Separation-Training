@@ -1,0 +1,58 @@
+# 检测数据准备 → 预训练送训（示例配置）
+# 用法：cp configs/detect_data_prep.example.yaml configs/detect_data_prep.yaml
+
+case_id: customer_case_001
+
+paths:
+  # 原始视频目录
+  raw_videos: /data/raw_videos/customer_case_001
+  # 本批输出根目录
+  output_root: data/prep/customer_case_001
+  # 现有 YOLO 检测权重（用于预标注）
+  pretrained_det_weights: /models/yolo_det/best.pt
+  # 原训练数据列表（合并时只读，不覆盖）
+  original_train_list: /data/lists/train.txt
+  # 训练工程使用的预训练 checkpoint（送训）
+  pretrain_checkpoint: /models/detector/pretrain.pt
+  # 可选：统一 images/labels 根（若 list 用相对路径）
+  dataset_root: /data/dataset
+
+extract:
+  fps: 5
+  image_ext: jpg
+  # ffmpeg 质量，2 较高
+  quality: 2
+  filename_pattern: "{video_stem}_f{frame_idx:06d}"
+
+infer:
+  # 预标注置信度阈值（按现网模型习惯调整）
+  conf: 0.25
+  iou: 0.45
+  imgsz: 640
+  device: 0
+  # 原始预测输出子目录名（相对 output_root）
+  labels_raw_subdir: labels_raw
+  labels_subdir: labels
+  frames_subdir: frames
+
+# 已确认规则：模型预测的 class 0 全部改为 1
+label_map:
+  0: 1
+# 若预测中出现未列出的 class → 停止并人工确认（见 Skill）
+allow_unmapped_classes: false
+
+merge:
+  new_list_name: new_only.txt
+  merged_list_name: train_merged.txt
+  # 去重键：image 路径规范化后比较
+  dedupe: true
+  # list 行格式：image_path | image_path label_path
+  # 需与 original_train_list 保持一致
+  line_format: image_only
+
+train:
+  mode: pretrain
+  # 占位：替换为实际训练入口
+  entry: train.py
+  # 额外 CLI 参数（按工程填写）
+  extra_args: []
