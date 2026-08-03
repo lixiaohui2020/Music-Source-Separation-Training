@@ -1,0 +1,2 @@
+# Generated ONNX artifacts are reproducible from the export scripts.
+onnx/
