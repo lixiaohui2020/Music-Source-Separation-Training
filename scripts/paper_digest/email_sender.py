@@ -5,6 +5,7 @@ import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from scripts.paper_digest.arxiv_client import Paper
@@ -19,6 +20,34 @@ def _format_authors(authors: list[str], max_count: int = 5) -> str:
     if len(authors) <= max_count:
         return ", ".join(authors)
     return ", ".join(authors[:max_count]) + f" 等 {len(authors)} 人"
+
+
+def _mendeley_links(paper: Paper) -> tuple[str, str, str]:
+    """Return (open_arxiv, bibtex, mendeley_import) URLs for one paper."""
+    stable_id = paper.stable_id
+    arxiv_url = paper.arxiv_url or f"https://arxiv.org/abs/{stable_id}"
+    bibtex_url = f"https://arxiv.org/bibtex/{stable_id}"
+    mendeley_import = f"https://www.mendeley.com/import/?url={quote(arxiv_url, safe='')}"
+    return arxiv_url, bibtex_url, mendeley_import
+
+
+def _render_mendeley_actions(paper: Paper) -> str:
+    arxiv_url, bibtex_url, mendeley_import = _mendeley_links(paper)
+    btn = (
+        "display:inline-block;margin:4px 8px 4px 0;padding:8px 12px;"
+        "border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;"
+    )
+    return f"""
+    <div style="margin:12px 0;padding:12px;background:#eef2ff;border-radius:8px;">
+      <p style="margin:0 0 8px;font-weight:600;color:#111;">📚 添加到 Mendeley</p>
+      <p style="margin:0 0 10px;color:#4b5563;font-size:13px;line-height:1.5;">
+        推荐：先点「打开 arXiv」，再用浏览器插件 <b>Mendeley Web Importer</b> 一键入库（含 PDF）。
+      </p>
+      <a href="{html.escape(arxiv_url)}" style="{btn}background:#4f46e5;color:#fff;">打开 arXiv</a>
+      <a href="{html.escape(mendeley_import)}" style="{btn}background:#0f766e;color:#fff;">Mendeley 导入页</a>
+      <a href="{html.escape(bibtex_url)}" style="{btn}background:#ffffff;color:#111;border:1px solid #cbd5e1;">下载 BibTeX</a>
+    </div>
+    """
 
 
 def _render_topic_tags(topics: list[str]) -> str:
@@ -80,6 +109,8 @@ def build_html_email(
                   <p style="margin:8px 0;"><a href="{html.escape(paper.arxiv_url)}">arXiv 论文页</a> ·
                   <a href="{html.escape(paper.pdf_url)}">PDF</a></p>
 
+                  {_render_mendeley_actions(paper)}
+
                   <div style="margin:12px 0;padding:12px;background:#f9fafb;border-radius:8px;">
                     <p style="margin:0 0 6px;font-weight:600;color:#111;">📌 核心介绍</p>
                     <p style="margin:0;color:#333;line-height:1.65;">{html.escape(analysis.brief_summary)}</p>
@@ -113,7 +144,11 @@ def build_html_email(
         <p style="color:#666;">{date_str} · 共 {len(papers)} 篇新论文 · 含作者原图与实验结果</p>
         {body}
         <hr style="border:none;border-top:1px solid #eee;margin:24px 0;" />
-        <p style="color:#999;font-size:12px;">流程图与实验结果提取自 arXiv PDF 原文；若个别论文未嵌入成功请点开 PDF 查看</p>
+        <p style="color:#999;font-size:12px;">
+          流程图与实验结果提取自 arXiv PDF 原文。感兴趣的论文可点「添加到 Mendeley」：
+          先安装 <a href="https://www.mendeley.com/reference-management/web-importer">Mendeley Web Importer</a>，
+          打开 arXiv 后点浏览器插件即可入库。
+        </p>
       </body>
     </html>
     """
